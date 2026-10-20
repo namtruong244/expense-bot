@@ -10,6 +10,7 @@ jobs:
   deploy:
     name: Build, Test & Deploy
     runs-on: ubuntu-latest
+    environment: "Edit Cloudflare Workers API"
 
     steps:
       - name: Checkout repository
@@ -37,3 +38,6 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
