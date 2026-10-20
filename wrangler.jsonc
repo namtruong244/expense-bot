@@ -15,8 +15,7 @@
 		{
 			"binding": "DB",
 			"database_name": "expense-db",
-			"database_id": "56dd405a-e644-40f9-afee-a7b090c72663",
-			"remote": true
+			"database_id": "56dd405a-e644-40f9-afee-a7b090c72663"
 		}
 	]
 	/**
