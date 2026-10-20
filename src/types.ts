@@ -103,6 +103,27 @@ export interface GeminiApiResponse {
   };
 }
 
+/** Model information item returned by Gemini v1beta/models endpoint */
+export interface GeminiModelInfo {
+  name: string;
+  version?: string;
+  displayName?: string;
+  description?: string;
+  supportedGenerationMethods?: string[];
+}
+
+/** Response returned by Google Gemini v1beta/models API */
+export interface GeminiListModelsResponse {
+  models?: GeminiModelInfo[];
+}
+
+/** Configuration key-value pair stored in app_config table */
+export interface AppConfigRow {
+  key: string;
+  value: string;
+  updated_at?: string;
+}
+
 /** Response structure for Telegram getFile API */
 export interface TelegramGetFileResponse {
   ok?: boolean;

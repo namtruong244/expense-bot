@@ -29,7 +29,7 @@ export async function handleShortcut(
 
   try {
     const aiPayload: GeminiPayload = { contents: [{ parts: [{ text }] }] };
-    const expense = await parseWithGemini(aiPayload, env.GEMINI_API_KEY);
+    const expense = await parseWithGemini(aiPayload, env.GEMINI_API_KEY, env.DB);
 
     if (expense.error) {
       return new Response(`⚠️ Error: ${expense.error}`);

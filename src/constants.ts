@@ -21,7 +21,13 @@ Strictly return data adhering to the JSON schema.
  * 1. gemini-3.8-flash: Primary high-speed vision/text model.
  * 2. gemini-3.5-flash: Automatic fallback model when primary is overloaded (503/429).
  */
+export const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
 export const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash"] as const;
+export const FALLBACK_GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-1.5-flash"] as const;
+
+export const CONFIG_KEY_ACTIVE_MODEL = "gemini_active_model";
+export const CONFIG_KEY_DISCOVERED_MODELS = "gemini_discovered_models";
+export const CONFIG_KEY_LAST_SYNCED = "gemini_models_last_synced";
 
 /** Default user ID when request is sent from Apple Shortcut without custom user_id */
 export const DEFAULT_USER_ID = "iphone_user";

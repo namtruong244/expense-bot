@@ -185,3 +185,44 @@ export async function payAllCreditCardExpenses(
 
   return toPayRows;
 }
+
+/**
+ * Retrieves a configuration value by key from the app_config table.
+ */
+export async function getConfig(db: D1Database, key: string): Promise<string | null> {
+  try {
+    const row = await db.prepare("SELECT value FROM app_config WHERE key = ?").bind(key).first<{ value: string }>();
+    return row?.value ?? null;
+  } catch {
+    try {
+      await db
+        .prepare(
+          "CREATE TABLE IF NOT EXISTS app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+        )
+        .run();
+    } catch {}
+    return null;
+  }
+}
+
+/**
+ * Sets or updates a configuration value by key in the app_config table.
+ */
+export async function setConfig(db: D1Database, key: string, value: string): Promise<void> {
+  const upsertSql =
+    "INSERT INTO app_config (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP";
+  try {
+    await db.prepare(upsertSql).bind(key, value).run();
+  } catch {
+    try {
+      await db
+        .prepare(
+          "CREATE TABLE IF NOT EXISTS app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+        )
+        .run();
+      await db.prepare(upsertSql).bind(key, value).run();
+    } catch (createErr: unknown) {
+      console.error("Failed to set config in D1:", createErr);
+    }
+  }
+}

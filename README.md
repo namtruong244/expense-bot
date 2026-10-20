@@ -28,6 +28,7 @@
 | `/month` | `/thismonth`, `/thangnay` | Monthly expense report grouped by category with net spending | `/month` |
 | `/debt` | `/credit`, `/nothe` | List all unpaid credit card bills and total outstanding debt | `/debt` |
 | `/pay <id\|ids\|all>` | `/trano`, `/paydebt` | Mark specific or all credit card bills as settled/paid | `/pay 5`<br>`/pay 5, 8`<br>`/pay all` |
+| `/model` | `/gemini` | View active Gemini model, switch models, or auto-sync from Google API | `/model`<br>`/model auto`<br>`/model gemini-3.5-flash`<br>`/model reset` |
 | `/delete` | `/xoa` | Undo / delete the most recent recorded transaction | `/delete` |
 
 ### Natural Language Examples

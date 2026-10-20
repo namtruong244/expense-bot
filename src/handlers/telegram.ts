@@ -61,7 +61,7 @@ export async function handleTelegramWebhook(
       return;
     }
 
-    const expense = await parseWithGemini(aiPayload, env.GEMINI_API_KEY);
+    const expense = await parseWithGemini(aiPayload, env.GEMINI_API_KEY, env.DB);
 
     if (expense.error) {
       await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, `⚠️ Recognition error: ${expense.error}`);

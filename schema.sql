@@ -12,3 +12,9 @@ CREATE TABLE IF NOT EXISTS expenses (
 
 CREATE INDEX IF NOT EXISTS idx_user_date ON expenses (user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_user_debt ON expenses (user_id, payment_method, is_paid);
+
+CREATE TABLE IF NOT EXISTS app_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);

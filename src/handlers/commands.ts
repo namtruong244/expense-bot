@@ -1,15 +1,24 @@
 import { formatAmount, formatCurrency } from "../formatters";
 import {
   deleteExpenseById,
+  getConfig,
   getLastExpense,
   getMonthExpensesByCategory,
   getTodayExpenses,
   getUnpaidCreditCardExpenses,
   payAllCreditCardExpenses,
   payCreditCardExpenses,
+  setConfig,
 } from "../services/db";
+import { syncAvailableGeminiModels } from "../services/gemini";
 import { sendTelegram } from "../services/telegram";
 import { Env, ExpenseRow } from "../types";
+import {
+  CONFIG_KEY_ACTIVE_MODEL,
+  CONFIG_KEY_DISCOVERED_MODELS,
+  DEFAULT_GEMINI_MODEL,
+  FALLBACK_GEMINI_MODELS,
+} from "../constants";
 
 /**
  * Handles incoming slash commands from Telegram users.
@@ -29,7 +38,7 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
         await sendTelegram(
           env.TELEGRAM_BOT_TOKEN,
           chatId,
-          "🤖 **Available Commands:**\n• Send text or receipt photo to record an expense (e.g., Coffee 40k)\n• Credit card purchase (e.g., Dinner 300k credit card)\n• Refund/Cancellation (e.g., Refund Shopee 100k)\n• /today: View today's transactions\n• /month: Monthly breakdown\n• /debt: View unpaid credit card bills\n• /pay <id>: Settle credit card bills\n• /delete: Delete the last transaction"
+          "🤖 **Available Commands:**\n• Send text or receipt photo to record an expense (e.g., Coffee 40k)\n• Credit card purchase (e.g., Dinner 300k credit card)\n• Refund/Cancellation (e.g., Refund Shopee 100k)\n• /today: View today's transactions\n• /month: Monthly breakdown\n• /debt: View unpaid credit card bills\n• /pay <id>: Settle credit card bills\n• /model: View or update Gemini AI model\n• /delete: Delete the last transaction"
         );
         break;
       }
@@ -189,6 +198,80 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
         msg += `\n💳 Remaining Unpaid Debt: **${formatCurrency(remainingTotal)}**`;
 
         await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, msg);
+        break;
+      }
+      case "/model":
+      case "/gemini": {
+        const parts = command.trim().split(/\s+/);
+        const arg = parts.slice(1).join(" ").trim();
+
+        if (!arg) {
+          const activeModel = (await getConfig(env.DB, CONFIG_KEY_ACTIVE_MODEL)) || DEFAULT_GEMINI_MODEL;
+          const cachedRaw = await getConfig(env.DB, CONFIG_KEY_DISCOVERED_MODELS);
+          let models: string[] = [...FALLBACK_GEMINI_MODELS];
+          if (cachedRaw) {
+            try {
+              const parsed = JSON.parse(cachedRaw) as string[];
+              if (Array.isArray(parsed) && parsed.length > 0) {
+                models = parsed;
+              }
+            } catch {}
+          }
+
+          let msg = "🤖 **Gemini AI Model Settings:**\n\n";
+          msg += `• Active Model: **${activeModel}** ⭐\n\n`;
+          msg += "📋 **Available Models:**\n";
+          for (let i = 0; i < models.length; i++) {
+            const m = models[i];
+            const star = m === activeModel ? " (Active ⭐)" : "";
+            msg += `${i + 1}. \`${m}\`${star}\n`;
+          }
+
+          msg += "\n💡 **Options:**\n";
+          msg += "• `/model <name>`: Switch to model (e.g. `/model gemini-3.5-flash`)\n";
+          msg += "• `/model auto`: Auto-detect & switch to newest model\n";
+          msg += "• `/model sync`: Refresh models list from Google\n";
+          msg += "• `/model reset`: Reset to default model";
+
+          await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, msg);
+          break;
+        }
+
+        const lowerArg = arg.toLowerCase();
+
+        if (lowerArg === "sync" || lowerArg === "auto") {
+          const { activeModel, models } = await syncAvailableGeminiModels(env.GEMINI_API_KEY, env.DB);
+
+          let msg = lowerArg === "auto" ? "🔄 **Gemini AI Auto-Updated:**\n" : "🔄 **Gemini Models Synchronized:**\n";
+          msg += `Active model set to: **${activeModel}** ⭐\n\n`;
+          msg += `Discovered ${models.length} compatible model(s):\n`;
+          for (const m of models) {
+            const star = m === activeModel ? " (Active ⭐)" : "";
+            msg += `• \`${m}\`${star}\n`;
+          }
+          msg += "\n👉 Switch model anytime with: `/model <name>`";
+
+          await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, msg);
+          break;
+        }
+
+        if (lowerArg === "reset") {
+          await setConfig(env.DB, CONFIG_KEY_ACTIVE_MODEL, DEFAULT_GEMINI_MODEL);
+          await sendTelegram(
+            env.TELEGRAM_BOT_TOKEN,
+            chatId,
+            `✅ Reset Gemini model to default: **${DEFAULT_GEMINI_MODEL}**`
+          );
+          break;
+        }
+
+        const targetModel = arg.replace(/^models\//i, "").trim();
+        await setConfig(env.DB, CONFIG_KEY_ACTIVE_MODEL, targetModel);
+        await sendTelegram(
+          env.TELEGRAM_BOT_TOKEN,
+          chatId,
+          `✅ Active Gemini model changed to: **${targetModel}**`
+        );
         break;
       }
     }
