@@ -8,6 +8,10 @@ import { CategorySummaryRow, ExpenseRow } from "../types";
  * @param amount Transaction amount (positive for expense, negative for refund).
  * @param category Transaction category (e.g. "Food & Dining", "Shopping").
  * @param description Detailed description of the transaction.
+ * @param paymentMethod "cash" or "credit_card".
+ * @param isPaid Whether the transaction is settled (defaults to unpaid for credit cards).
+ * @param createdAt Optional UTC timestamp ("YYYY-MM-DD HH:MM:SS") for back-dated transactions.
+ * @returns The new row ID (0 if the driver did not report one).
  */
 export async function insertExpense(
   db: D1Database,
@@ -16,8 +20,9 @@ export async function insertExpense(
   category: string,
   description: string,
   paymentMethod: string = "cash",
-  isPaid?: number
-): Promise<void> {
+  isPaid?: number,
+  createdAt?: string
+): Promise<number> {
   const safeUserId = (userId || "").trim() || "unknown_user";
   const safeAmount = typeof amount === "number" && Number.isFinite(amount) ? amount : 0;
   const safeCategory = (category || "").trim() || "Other";
@@ -25,12 +30,20 @@ export async function insertExpense(
   const safeMethod = (paymentMethod || "").trim() || "cash";
   const safeIsPaid = isPaid !== undefined ? (isPaid ? 1 : 0) : (safeMethod === "credit_card" ? 0 : 1);
 
-  await db
-    .prepare(
-      "INSERT INTO expenses (user_id, amount, category, description, payment_method, is_paid) VALUES (?, ?, ?, ?, ?, ?)"
-    )
-    .bind(safeUserId, safeAmount, safeCategory, safeDescription, safeMethod, safeIsPaid)
-    .run();
+  const result = createdAt
+    ? await db
+        .prepare(
+          "INSERT INTO expenses (user_id, amount, category, description, payment_method, is_paid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(safeUserId, safeAmount, safeCategory, safeDescription, safeMethod, safeIsPaid, createdAt)
+        .run()
+    : await db
+        .prepare(
+          "INSERT INTO expenses (user_id, amount, category, description, payment_method, is_paid) VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        .bind(safeUserId, safeAmount, safeCategory, safeDescription, safeMethod, safeIsPaid)
+        .run();
+  return result?.meta?.last_row_id ?? 0;
 }
 
 /**
@@ -46,7 +59,7 @@ export async function getTodayExpenses(
 ): Promise<ExpenseRow[]> {
   const safeUserId = (userId || "").trim();
   const query = `
-    SELECT amount, category, description
+    SELECT id, amount, category, description, payment_method, is_paid
     FROM expenses
     WHERE user_id = ? AND date(created_at, '+7 hours') = date('now', '+7 hours')
     ORDER BY created_at DESC
@@ -57,21 +70,133 @@ export async function getTodayExpenses(
 
 /**
  * Aggregates monthly expenses grouped by category for a specific user.
- * Aligned with UTC+7 local calendar month.
+ * Aligned with the UTC+7 local calendar month; `month` ("YYYY-MM") selects another month.
  */
 export async function getMonthExpensesByCategory(
   db: D1Database,
-  userId: string
+  userId: string,
+  month?: string
 ): Promise<CategorySummaryRow[]> {
   const safeUserId = (userId || "").trim();
   const query = `
     SELECT category, SUM(amount) as total_cat, COUNT(id) as count
     FROM expenses
-    WHERE user_id = ? AND strftime('%Y-%m', created_at, '+7 hours') = strftime('%Y-%m', 'now', '+7 hours')
+    WHERE user_id = ? AND strftime('%Y-%m', created_at, '+7 hours') = COALESCE(?, strftime('%Y-%m', 'now', '+7 hours'))
+    GROUP BY category ORDER BY total_cat DESC
+  `;
+  const result = await db.prepare(query).bind(safeUserId, month ?? null).all<CategorySummaryRow>();
+  return Array.isArray(result?.results) ? result.results : [];
+}
+
+/**
+ * Aggregates the last 7 local calendar days (today included) grouped by category.
+ */
+export async function getWeekExpensesByCategory(db: D1Database, userId: string): Promise<CategorySummaryRow[]> {
+  const safeUserId = (userId || "").trim();
+  const query = `
+    SELECT category, SUM(amount) as total_cat, COUNT(id) as count
+    FROM expenses
+    WHERE user_id = ? AND date(created_at, '+7 hours') >= date('now', '+7 hours', '-6 days')
     GROUP BY category ORDER BY total_cat DESC
   `;
   const result = await db.prepare(query).bind(safeUserId).all<CategorySummaryRow>();
   return Array.isArray(result?.results) ? result.results : [];
+}
+
+/**
+ * Sums the credit card spending of a month and how much of it is still unpaid.
+ */
+export async function getMonthCreditCardTotals(
+  db: D1Database,
+  userId: string,
+  month?: string
+): Promise<{ card_total: number; unpaid_total: number }> {
+  const safeUserId = (userId || "").trim();
+  const query = `
+    SELECT COALESCE(SUM(amount), 0) as card_total,
+           COALESCE(SUM(CASE WHEN is_paid = 0 THEN amount ELSE 0 END), 0) as unpaid_total
+    FROM expenses
+    WHERE user_id = ? AND payment_method = 'credit_card'
+      AND strftime('%Y-%m', created_at, '+7 hours') = COALESCE(?, strftime('%Y-%m', 'now', '+7 hours'))
+  `;
+  const row = await db
+    .prepare(query)
+    .bind(safeUserId, month ?? null)
+    .first<{ card_total: number; unpaid_total: number }>();
+  return { card_total: row?.card_total ?? 0, unpaid_total: row?.unpaid_total ?? 0 };
+}
+
+/**
+ * Retrieves the most recent transactions of a user (newest first).
+ */
+export async function getRecentExpenses(db: D1Database, userId: string, limit = 10): Promise<ExpenseRow[]> {
+  const safeUserId = (userId || "").trim();
+  const safeLimit = Math.max(1, Math.min(50, Math.floor(limit) || 10));
+  const query = `
+    SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
+    FROM expenses
+    WHERE user_id = ?
+    ORDER BY id DESC
+    LIMIT ?
+  `;
+  const result = await db.prepare(query).bind(safeUserId, safeLimit).all<ExpenseRow>();
+  return Array.isArray(result?.results) ? result.results : [];
+}
+
+/**
+ * Retrieves one transaction, only if it belongs to the given user.
+ */
+export async function getExpenseById(db: D1Database, userId: string, id: number): Promise<ExpenseRow | null> {
+  if (!Number.isInteger(id) || id <= 0) return null;
+  const query = `
+    SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
+    FROM expenses WHERE id = ? AND user_id = ?
+  `;
+  return (await db.prepare(query).bind(id, (userId || "").trim()).first<ExpenseRow>()) ?? null;
+}
+
+/** Changes the category of a user's transaction. */
+export async function updateExpenseCategory(
+  db: D1Database,
+  userId: string,
+  id: number,
+  category: string
+): Promise<void> {
+  await db
+    .prepare("UPDATE expenses SET category = ? WHERE id = ? AND user_id = ?")
+    .bind(category, id, (userId || "").trim())
+    .run();
+}
+
+/** Switches a user's transaction between cash (settled) and credit card (unpaid debt). */
+export async function updateExpensePayment(
+  db: D1Database,
+  userId: string,
+  id: number,
+  paymentMethod: "cash" | "credit_card"
+): Promise<void> {
+  const isPaid = paymentMethod === "credit_card" ? 0 : 1;
+  await db
+    .prepare("UPDATE expenses SET payment_method = ?, is_paid = ?, paid_at = NULL WHERE id = ? AND user_id = ?")
+    .bind(paymentMethod, isPaid, id, (userId || "").trim())
+    .run();
+}
+
+/**
+ * Records a Telegram update_id as handled. Returns false when the same (or a newer) update was
+ * already claimed, i.e. Telegram retried a webhook that is being or has been processed.
+ * Atomic: the conditional upsert only changes the row when the stored ID is older.
+ */
+export async function claimTelegramUpdate(db: D1Database, updateId: number): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `INSERT INTO app_config (key, value, updated_at) VALUES ('telegram_last_update_id', ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+       WHERE CAST(app_config.value AS INTEGER) < CAST(excluded.value AS INTEGER)`
+    )
+    .bind(String(updateId))
+    .run();
+  return (result?.meta?.changes ?? 1) > 0;
 }
 
 /**
@@ -82,21 +207,29 @@ export async function getLastExpense(
   userId: string
 ): Promise<ExpenseRow | null> {
   const safeUserId = (userId || "").trim();
-  const query = "SELECT id, amount, description FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 1";
+  const query =
+    "SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 1";
   return (await db.prepare(query).bind(safeUserId).first<ExpenseRow>()) ?? null;
 }
 
 /**
  * Deletes a transaction from the database by its primary key ID.
+ * When `userId` is given, only that user's transaction can be deleted.
+ *
+ * @returns true if a row was deleted.
  */
 export async function deleteExpenseById(
   db: D1Database,
-  id: number
-): Promise<void> {
+  id: number,
+  userId?: string
+): Promise<boolean> {
   if (typeof id !== "number" || !Number.isFinite(id) || id <= 0) {
-    return;
+    return false;
   }
-  await db.prepare("DELETE FROM expenses WHERE id = ?").bind(id).run();
+  const result = userId
+    ? await db.prepare("DELETE FROM expenses WHERE id = ? AND user_id = ?").bind(id, userId.trim()).run()
+    : await db.prepare("DELETE FROM expenses WHERE id = ?").bind(id).run();
+  return (result?.meta?.changes ?? 1) > 0;
 }
 
 /**

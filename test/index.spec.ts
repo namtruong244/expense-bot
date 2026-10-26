@@ -10,6 +10,16 @@ import worker, {
   WebhookUpdate,
   formatAmount,
   formatCurrency,
+  escapeHtml,
+  percentBar,
+  toLocalDate,
+  formatDate,
+  localMonth,
+  localToday,
+  buildTransactions,
+  claimTelegramUpdate,
+  handleCallbackQuery,
+  getRecentExpenses,
   insertExpense,
   getTodayExpenses,
   getMonthExpensesByCategory,
@@ -34,6 +44,8 @@ interface MockD1Config {
   allResults?: Record<string, unknown>[];
   firstResult?: Record<string, unknown> | null;
   onExecute?: (stmt: ExecutedStatement) => void;
+  /** Overrides for the metadata returned by run() (e.g. last_row_id, changes). */
+  runMeta?: { last_row_id?: number; changes?: number };
 }
 
 function createMockD1(config: MockD1Config = {}): {
@@ -82,7 +94,7 @@ function createMockD1(config: MockD1Config = {}): {
           return {
             results: [] as T[],
             success: true,
-            meta: mockMeta,
+            meta: { ...mockMeta, ...config.runMeta },
           };
         },
         raw: (async () => {
@@ -128,11 +140,25 @@ describe("Expense Bot Suite", () => {
   // ==========================================
   describe("formatters edge cases", () => {
     it("sanitizes NaN, Infinity, -Infinity safely to 0", () => {
-      expect(formatAmount(NaN)).toBe("₫0");
-      expect(formatAmount(Infinity)).toBe("₫0");
-      expect(formatAmount(-Infinity)).toBe("₫0");
-      expect(formatAmount(0)).toBe("₫0");
-      expect(formatCurrency(NaN)).toBe("₫0");
+      expect(formatAmount(NaN)).toBe("0 ₫");
+      expect(formatAmount(Infinity)).toBe("0 ₫");
+      expect(formatAmount(-Infinity)).toBe("0 ₫");
+      expect(formatAmount(0)).toBe("0 ₫");
+      expect(formatCurrency(NaN)).toBe("0 ₫");
+    });
+
+    it("formats amounts Vietnamese style and ignores the sign", () => {
+      expect(formatAmount(45000)).toBe("45.000 ₫");
+      expect(formatCurrency(-1234567)).toBe("1.234.567 ₫");
+    });
+
+    it("escapes HTML, builds bars and converts UTC timestamps to local dates", () => {
+      expect(escapeHtml("a<b>&c")).toBe("a&lt;b&gt;&amp;c");
+      expect(percentBar(40)).toBe("▓▓▓▓░░░░░░");
+      expect(percentBar(150)).toBe("▓▓▓▓▓▓▓▓▓▓");
+      expect(toLocalDate("2026-10-25 20:00:00")).toBe("2026-10-26");
+      expect(formatDate("2026-10-26")).toBe("26/10/2026");
+      expect(localMonth(-1, new Date("2026-01-15T00:00:00Z"))).toBe("2025-12");
     });
   });
 
@@ -235,7 +261,7 @@ describe("Expense Bot Suite", () => {
   // 1. sendTelegram
   // ==========================================
   describe("sendTelegram()", () => {
-    it("sends POST request to Telegram sendMessage API with Markdown parse mode", async () => {
+    it("sends POST request to Telegram sendMessage API with HTML parse mode", async () => {
       const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
       globalThis.fetch = fetchMock;
 
@@ -256,7 +282,7 @@ describe("Expense Bot Suite", () => {
       expect(parsedBody).toEqual({
         chat_id: 987654321,
         text: "Hello!",
-        parse_mode: "Markdown",
+        parse_mode: "HTML",
       });
     });
 
@@ -271,7 +297,7 @@ describe("Expense Bot Suite", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it("retries without Markdown parse mode if Telegram returns 400 parse error", async () => {
+    it("retries as plain text if Telegram returns 400 parse error", async () => {
       const fetchMock = vi
         .fn()
         .mockResolvedValueOnce(
@@ -283,12 +309,26 @@ describe("Expense Bot Suite", () => {
 
       globalThis.fetch = fetchMock;
 
-      await sendTelegram("bot_tok", 12345, "Unmatched * asterisk");
+      await sendTelegram("bot_tok", 12345, "<b>Unmatched</b> &lt;tag");
 
       expect(fetchMock).toHaveBeenCalledTimes(2);
       const secondInit = fetchMock.mock.calls[1]?.[1] as RequestInit;
       const body = JSON.parse(secondInit.body as string) as { parse_mode?: string };
       expect(body.parse_mode).toBeUndefined();
+      expect((body as { text: string }).text).toBe("Unmatched <tag");
+    });
+
+    it("includes reply_markup when a keyboard is given", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
+      globalThis.fetch = fetchMock;
+      const kb = { inline_keyboard: [[{ text: "OK", callback_data: "cancel" }]] };
+
+      await sendTelegram("tok", 1, "hi", kb);
+
+      const body = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string) as {
+        reply_markup: unknown;
+      };
+      expect(body.reply_markup).toEqual(kb);
     });
 
     it("catches network error gracefully without throwing exception", async () => {
@@ -434,7 +474,8 @@ describe("Expense Bot Suite", () => {
       const body = JSON.parse(calledInit.body as string) as {
         system_instruction: { parts: Array<{ text: string }> };
       };
-      expect(body.system_instruction.parts[0]?.text).toBe(SYSTEM_PROMPT);
+      expect(body.system_instruction.parts[0]?.text).toContain(SYSTEM_PROMPT);
+      expect(body.system_instruction.parts[0]?.text).toContain(`Today's date (UTC+7) is ${localToday()}`);
     });
 
     it("cleans markdown code block (```json) from Gemini candidate text", async () => {
@@ -743,582 +784,528 @@ describe("Expense Bot Suite", () => {
   });
 
   // ==========================================
-  // 4. handleCommand
+  // 4. Handler test helpers
+  // ==========================================
+  interface TelegramCall {
+    method: string;
+    body: Record<string, unknown>;
+  }
+  interface SentMessage {
+    chat_id: number;
+    text: string;
+    reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+  }
+
+  const baseEnv = (db: D1Database, extra: Partial<Env> = {}): Env => ({
+    DB: db,
+    TELEGRAM_BOT_TOKEN: "tok",
+    GEMINI_API_KEY: "gem",
+    ...extra,
+  });
+
+  interface NetworkOptions {
+    /** JSON returned (as the model's text) by Gemini generateContent. */
+    gemini?: unknown;
+    /** HTTP status for Gemini generateContent (default 200). */
+    geminiStatus?: number;
+    /** HTTP status for Telegram getFile (default 200). */
+    getFileStatus?: number;
+  }
+
+  /** Routes fetches by URL so tests do not depend on call order. */
+  function mockNetwork(opts: NetworkOptions = {}) {
+    const fetchMock = vi.fn(async (input: string, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("generativelanguage") && url.includes(":generateContent")) {
+        if (opts.geminiStatus && opts.geminiStatus !== 200) {
+          return new Response(JSON.stringify({ error: { message: "busy" } }), { status: opts.geminiStatus });
+        }
+        return new Response(
+          JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(opts.gemini ?? {}) }] } }] })
+        );
+      }
+      if (url.includes("/getFile")) {
+        return new Response(JSON.stringify({ ok: true, result: { file_path: "photos/r.jpg" } }), {
+          status: opts.getFileStatus ?? 200,
+        });
+      }
+      if (url.includes("/file/bot")) {
+        return new Response(new Uint8Array([1, 2, 3]));
+      }
+      return new Response(JSON.stringify({ ok: true }));
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    return fetchMock;
+  }
+
+  function telegramCalls(fetchMock: ReturnType<typeof mockNetwork>): TelegramCall[] {
+    const calls: TelegramCall[] = [];
+    for (const [url, init] of fetchMock.mock.calls) {
+      const match = /api\.telegram\.org\/bot[^/]+\/(\w+)$/.exec(String(url));
+      if (match) calls.push({ method: match[1], body: JSON.parse(String(init?.body ?? "{}")) });
+    }
+    return calls;
+  }
+
+  const sentMessages = (fetchMock: ReturnType<typeof mockNetwork>): SentMessage[] =>
+    telegramCalls(fetchMock)
+      .filter((c) => c.method === "sendMessage")
+      .map((c) => c.body as unknown as SentMessage);
+
+  async function runCommand(cmd: string, db: D1Database, extra: Partial<Env> = {}, chatId = 1111) {
+    const fm = mockNetwork();
+    await handleCommand(cmd, chatId, baseEnv(db, extra));
+    return { fm, messages: sentMessages(fm) };
+  }
+
+  const buttons = (m: SentMessage) => (m.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.callback_data);
+
+  const post = (update: unknown, env: Env, ctx?: ExecutionContext) =>
+    worker.fetch(
+      new Request("https://example.com", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(update),
+      }),
+      env,
+      ctx
+    );
+
+  const expenseItem = (overrides: Record<string, unknown> = {}) => ({
+    amount: 35000,
+    category: "Food & Dining",
+    description: "Sandwich",
+    transaction_type: "expense",
+    payment_method: "cash",
+    ...overrides,
+  });
+
+  const localDateOffset = (days: number) =>
+    new Date(Date.now() + 7 * 3600_000 + days * 86_400_000).toISOString().slice(0, 10);
+
+  // ==========================================
+  // 4.1 record helpers & db additions
+  // ==========================================
+  describe("buildTransactions()", () => {
+    it("accepts a flat object and the transactions array", () => {
+      expect(buildTransactions(expenseItem())).toHaveLength(1);
+      const many = buildTransactions({ transactions: [expenseItem(), expenseItem({ amount: 5000 })] });
+      expect(many.map((t) => t.amount)).toEqual([35000, 5000]);
+    });
+
+    it("drops entries without a positive amount and caps the list at 10", () => {
+      const items = [expenseItem({ amount: 0 }), expenseItem({ amount: undefined })];
+      expect(buildTransactions({ transactions: items })).toHaveLength(0);
+      const many = Array.from({ length: 15 }, () => expenseItem());
+      expect(buildTransactions({ transactions: many })).toHaveLength(10);
+    });
+
+    it("signs refunds negatively and marks credit cards as unpaid", () => {
+      const [refund] = buildTransactions(expenseItem({ transaction_type: "refund" }));
+      expect(refund.amount).toBe(-35000);
+      const [card] = buildTransactions(expenseItem({ payment_method: "credit_card" }));
+      expect(card).toMatchObject({ paymentMethod: "credit_card", isPaid: false });
+      const [forced] = buildTransactions(expenseItem(), true);
+      expect(forced.paymentMethod).toBe("credit_card");
+    });
+
+    it("keeps only valid back-dates from the past year", () => {
+      const yesterday = localDateOffset(-1);
+      expect(buildTransactions(expenseItem({ date: yesterday }))[0].date).toBe(yesterday);
+      expect(buildTransactions(expenseItem({ date: localToday() }))[0].date).toBeUndefined();
+      expect(buildTransactions(expenseItem({ date: localDateOffset(2) }))[0].date).toBeUndefined();
+      expect(buildTransactions(expenseItem({ date: localDateOffset(-400) }))[0].date).toBeUndefined();
+      expect(buildTransactions(expenseItem({ date: "2026-02-31" }))[0].date).toBeUndefined();
+      expect(buildTransactions(expenseItem({ date: "yesterday" }))[0].date).toBeUndefined();
+    });
+  });
+
+  describe("db additions", () => {
+    it("insertExpense returns the new row id and honors a back-dated created_at", async () => {
+      const { db, statements } = createMockD1({ runMeta: { last_row_id: 77 } });
+      const id = await insertExpense(db, "u1", 1000, "Other", "x", "cash", 1, "2026-10-01 05:00:00");
+      expect(id).toBe(77);
+      expect(statements[0].sql).toContain("created_at");
+      expect(statements[0].bindings.at(-1)).toBe("2026-10-01 05:00:00");
+    });
+
+    it("claimTelegramUpdate reports whether the update was newly claimed", async () => {
+      expect(await claimTelegramUpdate(createMockD1({ runMeta: { changes: 1 } }).db, 5)).toBe(true);
+      expect(await claimTelegramUpdate(createMockD1({ runMeta: { changes: 0 } }).db, 5)).toBe(false);
+    });
+
+    it("getRecentExpenses clamps the limit", async () => {
+      const { db, statements } = createMockD1();
+      await getRecentExpenses(db, "u1", 9999);
+      expect(statements[0].bindings).toEqual(["u1", 50]);
+    });
+
+    it("deleteExpenseById scopes to the user when given", async () => {
+      const { db, statements } = createMockD1({ runMeta: { changes: 1 } });
+      expect(await deleteExpenseById(db, 3, "u1")).toBe(true);
+      expect(statements[0].bindings).toEqual([3, "u1"]);
+    });
+  });
+
+  // ==========================================
+  // 4.2 handleCommand
   // ==========================================
   describe("handleCommand()", () => {
-    it("/start or /help: sends bot instructions message", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1();
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/start", 1111, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Available Commands:");
-      expect(body.text).toContain("/today");
-      expect(body.text).toContain("/month");
-      expect(body.text).toContain("/delete");
+    it("/start welcomes the user and registers the command menu", async () => {
+      const { fm, messages } = await runCommand("/start", createMockD1().db);
+      expect(messages[0].text).toContain("Chào bạn");
+      const setCommands = telegramCalls(fm).find((c) => c.method === "setMyCommands");
+      const names = (setCommands?.body.commands as Array<{ command: string }>).map((c) => c.command);
+      expect(names).toEqual(expect.arrayContaining(["today", "month", "debt", "delete"]));
     });
 
-    it("/help: sends the same command guide as /start", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1();
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/help", 1112, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Available Commands:");
+    it("/help lists Vietnamese aliases and hides /model from non-admins", async () => {
+      const user = await runCommand("/help", createMockD1().db, { ADMIN_CHAT_ID: "1" });
+      expect(user.messages[0].text).toContain("/homnay");
+      expect(user.messages[0].text).not.toContain("/model");
+      const admin = await runCommand("/help", createMockD1().db, { ADMIN_CHAT_ID: "1111" });
+      expect(admin.messages[0].text).toContain("/model");
     });
 
-    it("/today: notifies when no transactions are recorded today", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1({ allResults: [] });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/today", 2222, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toBe("📅 No transactions recorded today.");
+    it("replies to unknown commands and accepts the @botname suffix", async () => {
+      const unknown = await runCommand("/abc", createMockD1().db);
+      expect(unknown.messages[0].text).toContain("chưa có lệnh");
+      const suffixed = await runCommand("/today@my_bot", createMockD1().db);
+      expect(suffixed.messages[0].text).toContain("chưa có giao dịch");
     });
 
-    it("/today: calculates net total with 🔴 for expenses and 🟢 for refunds", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
+    it("/today lists transactions, escapes HTML and totals the net amount", async () => {
       const { db } = createMockD1({
         allResults: [
-          { amount: 50000, category: "Food & Dining", description: "Lunch" },
-          { amount: -20000, category: "Food & Dining", description: "Split bill refund" },
+          { id: 1, amount: 45000, category: "Food & Dining", description: "Phở <bò>", payment_method: "cash" },
+          { id: 2, amount: 20000, category: "Shopping", description: "Áo", payment_method: "credit_card" },
+          { id: 3, amount: -10000, category: "Shopping", description: "Hoàn tiền", payment_method: "cash" },
         ],
       });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/today", 3333, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-
-      expect(body.text).toContain("📅 **Today's Transactions:**");
-      expect(body.text).toContain("🔴 **₫50,000** - Food & Dining: Lunch");
-      expect(body.text).toContain("🟢 **₫20,000** - Food & Dining: Split bill refund");
-      expect(body.text).toContain("🔴 Total Spent:");
-      expect(body.text).toContain("30,000");
+      const { messages } = await runCommand("/today", db);
+      const text = messages[0].text;
+      expect(text).toContain("45.000 ₫");
+      expect(text).toContain("Ăn uống");
+      expect(text).toContain("Phở &lt;bò&gt;");
+      expect(text).toContain("💳");
+      expect(text).toContain("🟢");
+      expect(text).toContain("Tổng chi: 55.000 ₫");
     });
 
-    it("/today: displays '🟢 Net Surplus:' when refunds exceed expenses", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
+    it("/today shows a net surplus when refunds exceed expenses", async () => {
+      const { db } = createMockD1({ allResults: [{ id: 1, amount: -50000, category: "Other", description: "Refund" }] });
+      const { messages } = await runCommand("/homnay", db);
+      expect(messages[0].text).toContain("Tiết kiệm ròng: 50.000 ₫");
+    });
 
-      const { db } = createMockD1({
-        allResults: [{ amount: -150000, category: "Shopping", description: "Order Refund" }],
+    it("/month reports category shares with bars and credit card totals", async () => {
+      const { db, statements } = createMockD1({
+        allResults: [
+          { category: "Food & Dining", total_cat: 600000, count: 3 },
+          { category: "Shopping", total_cat: 400000, count: 1 },
+        ],
+        firstResult: { card_total: 500000, unpaid_total: 200000 },
       });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/today", 4444, env);
-
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("🟢 Net Surplus:");
-      expect(body.text).toContain("150,000");
+      const { messages } = await runCommand("/month", db);
+      const text = messages[0].text;
+      expect(text).toContain("60%");
+      expect(text).toContain("▓▓▓▓▓▓░░░░");
+      expect(text).toContain("3 khoản");
+      expect(text).toContain("Tổng chi thực tế: 1.000.000 ₫");
+      expect(text).toContain("Quẹt thẻ: 500.000 ₫ (chưa trả: 200.000 ₫)");
+      expect(statements[0].bindings).toEqual(["1111", null]);
     });
 
-    it("/month: notifies when no transactions are recorded this month", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
+    it("/month prev queries the previous month; bad arguments are rejected", async () => {
+      const { db, statements } = createMockD1({ allResults: [{ category: "Other", total_cat: 1000, count: 1 }] });
+      const prev = await runCommand("/month prev", db);
+      expect(statements[0].bindings).toEqual(["1111", localMonth(-1)]);
+      expect(prev.messages[0].text).toContain(`${localMonth(-1).slice(5)}/${localMonth(-1).slice(0, 4)}`);
 
-      const { db } = createMockD1({ allResults: [] });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/month", 5555, env);
-
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toBe("📊 No transactions recorded this month.");
+      const bad = await runCommand("/month 13-2026", createMockD1().db);
+      expect(bad.messages[0].text).toContain("Tháng không hợp lệ");
     });
 
-    it("/month: groups by category and computes actual monthly spending", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
+    it("/month and /week tell the user when nothing was recorded", async () => {
+      expect((await runCommand("/month", createMockD1().db)).messages[0].text).toContain("Tháng này");
+      expect((await runCommand("/month prev", createMockD1().db)).messages[0].text).toContain("Tháng đó");
+      expect((await runCommand("/week", createMockD1().db)).messages[0].text).toContain("7 ngày qua");
+    });
 
+    it("/month shows a net surplus when refunds exceed spending", async () => {
+      const { db } = createMockD1({ allResults: [{ category: "Shopping", total_cat: -30000, count: 1 }] });
+      const { messages } = await runCommand("/month", db);
+      expect(messages[0].text).toContain("Tiết kiệm ròng: 30.000 ₫");
+      expect(messages[0].text).toContain("-30.000 ₫");
+    });
+
+    it("/week summarises the last 7 days", async () => {
+      const { db } = createMockD1({ allResults: [{ category: "Transportation", total_cat: 80000, count: 4 }] });
+      const { messages } = await runCommand("/week", db);
+      expect(messages[0].text).toContain("7 ngày gần nhất");
+      expect(messages[0].text).toContain("Di chuyển");
+      expect(messages[0].text).toContain("100%");
+    });
+
+    it("/recent lists the latest transactions with IDs and local dates", async () => {
       const { db } = createMockD1({
         allResults: [
-          { category: "Food & Dining", total_cat: 350000, count: 5 },
-          { category: "Transportation", total_cat: 100000, count: 2 },
-          { category: "Shopping", total_cat: -50000, count: 1 },
+          { id: 7, amount: 30000, category: "Other", description: "Cafe", payment_method: "cash", created_at: "2026-10-25 03:00:00" },
         ],
       });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/month", 6666, env);
-
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-
-      expect(body.text).toContain("📊 **Monthly Expense Report:**");
-      expect(body.text).toContain("• **Food & Dining**: ₫350,000");
-      expect(body.text).toContain("• **Transportation**: ₫100,000");
-      expect(body.text).toContain("• **Shopping**: -₫50,000");
-      expect(body.text).toContain("🔴 Actual Total Spent:");
-      expect(body.text).toContain("400,000");
+      const { messages } = await runCommand("/recent", db);
+      expect(messages[0].text).toContain("#7");
+      expect(messages[0].text).toContain("25/10");
+      expect(messages[0].text).toContain("Cafe");
+      expect((await runCommand("/recent", createMockD1().db)).messages[0].text).toContain("Chưa có giao dịch");
     });
 
-    it("/month: displays '🟢 Net Surplus:' when monthly grand total is negative", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
+    it("/delete asks for confirmation instead of deleting immediately", async () => {
+      const { db, statements } = createMockD1({
+        firstResult: { id: 5, amount: 45000, category: "Food & Dining", description: "Phở", payment_method: "cash" },
+      });
+      const { messages } = await runCommand("/delete", db);
+      expect(messages[0].text).toContain("Xoá giao dịch này?");
+      expect(messages[0].text).toContain("Phở");
+      expect(buttons(messages[0])).toEqual(["del:5", "cancel"]);
+      expect(statements.some((st) => st.sql.includes("DELETE"))).toBe(false);
+    });
 
+    it("/delete <id> targets a specific transaction and validates input", async () => {
+      const row = { id: 12, amount: 1000, category: "Other", description: "x" };
+      const found = await runCommand("/xoa 12", createMockD1({ firstResult: row }).db);
+      expect(buttons(found.messages[0])).toEqual(["del:12", "cancel"]);
+
+      expect((await runCommand("/delete abc", createMockD1().db)).messages[0].text).toContain("Số hiệu không hợp lệ");
+      expect((await runCommand("/delete 99", createMockD1().db)).messages[0].text).toContain("Không tìm thấy");
+      expect((await runCommand("/delete", createMockD1().db)).messages[0].text).toContain("Không có giao dịch");
+    });
+
+    it("/debt lists unpaid bills with pay buttons", async () => {
       const { db } = createMockD1({
-        allResults: [{ category: "Shopping", total_cat: -200000, count: 1 }],
+        allResults: [
+          { id: 5, amount: 100000, category: "Shopping", description: "Zara", created_at: "2026-10-20 03:00:00" },
+          { id: 8, amount: 350000, category: "Food & Dining", description: "Dinner", created_at: "2026-10-21 03:00:00" },
+        ],
       });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/month", 7777, env);
-
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("🟢 Net Surplus:");
+      const { messages } = await runCommand("/debt", db);
+      expect(messages[0].text).toContain("#5");
+      expect(messages[0].text).toContain("20/10/2026");
+      expect(messages[0].text).toContain("Tổng nợ: 450.000 ₫");
+      expect(buttons(messages[0])).toEqual(["pay:5", "pay:8", "payall"]);
     });
 
-    it("/delete: notifies when no transaction is found to delete", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1({ firstResult: null });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/delete", 8888, env);
-
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toBe("No transactions found.");
+    it("/debt omits 'pay all' for a single bill and reports when there is no debt", async () => {
+      const one = await runCommand("/nothe", createMockD1({ allResults: [{ id: 5, amount: 1000, description: "x" }] }).db);
+      expect(buttons(one.messages[0])).toEqual(["pay:5"]);
+      expect((await runCommand("/debt", createMockD1().db)).messages[0].text).toContain("Không có khoản thẻ");
     });
 
-    it("/delete: removes the latest expense transaction from database", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
+    it("/pay validates arguments", async () => {
+      expect((await runCommand("/pay", createMockD1().db)).messages[0].text).toContain("/pay all");
+      expect((await runCommand("/pay abc", createMockD1().db)).messages[0].text).toContain("Số hiệu không hợp lệ");
+      expect((await runCommand("/pay 5", createMockD1().db)).messages[0].text).toContain("Không tìm thấy");
+    });
 
+    it("/pay <ids> settles bills and shows the remaining debt", async () => {
       const { db, statements } = createMockD1({
-        firstResult: { id: 99, amount: 45000, description: "Noodles" },
+        allResults: [{ id: 5, amount: 100000, description: "Dinner" }],
       });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/delete", 9999, env);
-
-      const deleteStmt = statements.find((s) => s.sql.includes("DELETE FROM expenses"));
-      expect(deleteStmt).toBeDefined();
-      expect(deleteStmt?.bindings).toEqual([99]);
-
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("🗑 Deleted expense: **₫45,000** (Noodles)");
+      const { messages } = await runCommand("/pay 5, 8", db);
+      expect(messages[0].text).toContain("Đã ghi nhận thanh toán");
+      expect(messages[0].text).toContain("#5: 100.000 ₫");
+      expect(messages[0].text).toContain("Còn nợ");
+      expect(statements.some((st) => st.sql.includes("UPDATE expenses"))).toBe(true);
     });
 
-    it("/delete: removes the latest refund transaction and identifies as refund", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
+    it("/pay all asks for confirmation first", async () => {
+      const { db, statements } = createMockD1({ allResults: [{ id: 5, amount: 100000, description: "Dinner" }] });
+      const { messages } = await runCommand("/pay all", db);
+      expect(messages[0].text).toContain("Trả hết");
+      expect(messages[0].text).toContain("100.000 ₫");
+      expect(buttons(messages[0])).toEqual(["payallok", "cancel"]);
+      expect(statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
 
-      const { db, statements } = createMockD1({
-        firstResult: { id: 101, amount: -80000, description: "Store Refund" },
-      });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/delete", 10101, env);
-
-      const deleteStmt = statements.find((s) => s.sql.includes("DELETE FROM expenses"));
-      expect(deleteStmt).toBeDefined();
-      expect(deleteStmt?.bindings).toEqual([101]);
-
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("🗑 Deleted refund: **₫80,000** (Store Refund)");
+      expect((await runCommand("/pay all", createMockD1().db)).messages[0].text).toContain("Không có khoản thẻ");
     });
 
-    it("does nothing for unrecognized commands", async () => {
-      const fetchMock = vi.fn();
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1();
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/unknown_command_xyz", 1234, env);
-      expect(fetchMock).not.toHaveBeenCalled();
+    it("/model shows the active model and options", async () => {
+      const { messages } = await runCommand("/model", createMockD1().db);
+      expect(messages[0].text).toContain("Cài đặt model Gemini AI");
+      expect(messages[0].text).toContain("Model đang dùng:");
+      expect(messages[0].text).toContain("/model auto");
     });
 
-    it("catches database exception and informs user with error message", async () => {
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
+    it("/model auto synchronizes models from Google", async () => {
+      const fetchMock = vi.fn(async (input: string, _init?: RequestInit) =>
+        String(input).includes("/v1beta/models?key=")
+          ? new Response(
+              JSON.stringify({
+                models: [
+                  { name: "models/gemini-3.1-flash", supportedGenerationMethods: ["generateContent"] },
+                  { name: "models/gemini-3.5-flash", supportedGenerationMethods: ["generateContent"] },
+                ],
+              })
+            )
+          : new Response(JSON.stringify({ ok: true }))
+      );
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
 
-      const errorDb: D1Database = {
-        prepare: () => {
-          throw new Error("D1 connection lost");
-        },
-        withSession: () => ({ prepare: () => ({} as D1PreparedStatement), batch: () => Promise.resolve([]), getBookmark: () => null }),
-        dump: async () => new ArrayBuffer(0),
-        batch: async () => [],
-        exec: async () => ({ count: 0, duration: 0 }),
-      };
-
-      const env: Env = {
-        DB: errorDb,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/today", 9999, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("An error occurred while processing your request");
+      await handleCommand("/model auto", 7777, baseEnv(createMockD1().db, { ADMIN_CHAT_ID: "7777" }));
+      const text = sentMessages(fetchMock as unknown as ReturnType<typeof mockNetwork>)[0].text;
+      expect(text).toContain("Đã tự cập nhật model Gemini");
+      expect(text).toContain("Model đang dùng:");
     });
 
-    it("/debt: notifies when no unpaid credit card bills exist", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1({ allResults: [] });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/debt", 5555, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("No unpaid credit card bills found");
+    it("/model reset and /model <name> change the model for the admin", async () => {
+      const env = { ADMIN_CHAT_ID: "7777" };
+      const reset = await runCommand("/model reset", createMockD1().db, env, 7777);
+      expect(reset.messages[0].text).toContain("gemini-3.1-flash");
+      const named = await runCommand("/model gemini-3.5-flash", createMockD1().db, env, 7777);
+      expect(named.messages[0].text).toContain("Đã đổi model Gemini sang: <b>gemini-3.5-flash</b>");
     });
 
-    it("/debt: lists unpaid credit card bills with total and instructions", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const mockUnpaid: ExpenseRow[] = [
-        { id: 12, user_id: "5555", amount: 450000, category: "Shopping", description: "Zara jacket", payment_method: "credit_card", is_paid: 0, created_at: "2026-10-15 10:00:00" },
-        { id: 15, user_id: "5555", amount: 120000, category: "Food & Dining", description: "Dinner", payment_method: "credit_card", is_paid: 0, created_at: "2026-10-18 19:00:00" },
-      ];
-
-      const { db } = createMockD1({ allResults: mockUnpaid as unknown as Record<string, unknown>[] });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/debt", 5555, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Unpaid Credit Card Bills:");
-      expect(body.text).toContain("#12");
-      expect(body.text).toContain("Zara jacket");
-      expect(body.text).toContain("#15");
-      expect(body.text).toContain("Total Unpaid Debt:");
-      expect(body.text).toContain("570,000");
-      expect(body.text).toContain("/pay <id>");
-    });
-
-    it("/pay: prompts user to specify bill IDs when no arguments are provided", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1();
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/pay", 5555, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Please specify bill ID(s) to pay");
-    });
-
-    it("/pay: prompts error when invalid bill ID format is supplied", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1();
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/pay abc, xyz", 5555, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Invalid bill ID(s)");
-    });
-
-    it("/pay: marks specific bills as paid and shows remaining debt", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const paidRows: ExpenseRow[] = [
-        { id: 12, user_id: "5555", amount: 450000, category: "Shopping", description: "Zara jacket", payment_method: "credit_card", is_paid: 0 },
-      ];
-
-      const { db } = createMockD1({ allResults: paidRows as unknown as Record<string, unknown>[] });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/pay 12", 5555, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Credit Card Payment Recorded:");
-      expect(body.text).toContain("Paid 1 bill(s) totaling **₫450,000**");
-      expect(body.text).toContain("#12");
-    });
-
-    it("/pay: marks all bills as paid with /pay all", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const allRows: ExpenseRow[] = [
-        { id: 12, user_id: "5555", amount: 450000, category: "Shopping", description: "Zara jacket", payment_method: "credit_card", is_paid: 0 },
-        { id: 15, user_id: "5555", amount: 120000, category: "Food & Dining", description: "Dinner", payment_method: "credit_card", is_paid: 0 },
-      ];
-
-      const { db } = createMockD1({ allResults: allRows as unknown as Record<string, unknown>[] });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/pay all", 5555, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Paid 2 bill(s) totaling **₫570,000**");
-    });
-
-    it("/pay: notifies when /pay all is called with no unpaid bills", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1({ allResults: [] });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/pay all", 5555, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("No unpaid credit card bills to pay");
-    });
-
-    it("/pay: notifies when specified IDs do not match any unpaid bills", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1({ allResults: [] });
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/pay 999", 5555, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("No matching unpaid credit card bills found");
-    });
-
-    it("/model: shows active model and available options", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1();
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
-
-      await handleCommand("/model", 7777, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Gemini AI Model Settings");
-      expect(body.text).toContain("Active Model:");
-      expect(body.text).toContain("/model <name>");
-      expect(body.text).toContain("/model auto");
-    });
-
-    it("/model auto: synchronizes models from Google and sets active model", async () => {
-      const fetchMock = vi
-        .fn()
-        .mockResolvedValueOnce(
-          new Response(
-            JSON.stringify({
-              models: [
-                { name: "models/gemini-3.1-flash", supportedGenerationMethods: ["generateContent"] },
-                { name: "models/gemini-3.5-flash", supportedGenerationMethods: ["generateContent"] },
-              ],
-            })
-          )
-        )
-        .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })));
-
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1();
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-        ADMIN_CHAT_ID: "7777",
-      };
-
-      await handleCommand("/model auto", 7777, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Gemini AI Auto-Updated");
-      expect(body.text).toContain("Active model set to:");
-    });
-
-    it("/model reset: resets active model to default", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1();
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-        ADMIN_CHAT_ID: "7777",
-      };
-
-      await handleCommand("/model reset", 7777, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Reset Gemini model to default: **gemini-3.1-flash**");
-    });
-
-    it("/model <name>: switches active model to specified name", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
-      const { db } = createMockD1();
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-        ADMIN_CHAT_ID: "7777",
-      };
-
-      await handleCommand("/model gemini-3.5-flash", 7777, env);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Active Gemini model changed to: **gemini-3.5-flash**");
-    });
-
-    it("/model <name>: rejects non-admin chats and invalid names", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-      globalThis.fetch = fetchMock;
-
+    it("/model rejects non-admin chats and invalid names", async () => {
       const { db, statements } = createMockD1();
-      const env: Env = { DB: db, TELEGRAM_BOT_TOKEN: "tok_123", GEMINI_API_KEY: "gem_123", ADMIN_CHAT_ID: "1" };
-
-      await handleCommand("/model gemini-2.5-pro", 7777, env);
-      let body = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string) as { text: string };
-      expect(body.text).toContain("Only the bot admin");
-
-      await handleCommand("/model x#", 1, env);
-      body = JSON.parse((fetchMock.mock.calls[1] as [string, RequestInit])[1].body as string) as { text: string };
-      expect(body.text).toContain("Invalid model name");
+      const nonAdmin = await runCommand("/model gemini-2.5-pro", db, { ADMIN_CHAT_ID: "1" }, 7777);
+      expect(nonAdmin.messages[0].text).toContain("Chỉ quản trị viên");
+      const invalid = await runCommand("/model x#", db, { ADMIN_CHAT_ID: "1" }, 1);
+      expect(invalid.messages[0].text).toContain("Tên model không hợp lệ");
       expect(statements).toHaveLength(0);
+    });
+
+    it("catches database exceptions and replies with a friendly error", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const { db } = createMockD1({
+        onExecute: () => {
+          throw new Error("D1 down");
+        },
+      });
+      const { messages } = await runCommand("/today", db);
+      expect(messages[0].text).toContain("Có lỗi xảy ra");
+      expect(messages[0].text).not.toContain("D1 down");
+    });
+  });
+
+  // ==========================================
+  // 4.3 Inline keyboard callbacks
+  // ==========================================
+  describe("handleCallbackQuery()", () => {
+    const row = {
+      id: 5,
+      amount: 45000,
+      category: "Food & Dining",
+      description: "Phở",
+      payment_method: "cash",
+      is_paid: 1,
+      created_at: "2020-01-01 03:00:00",
+    };
+
+    async function press(data: string, config: MockD1Config = { firstResult: row }) {
+      const fm = mockNetwork();
+      const mock = createMockD1(config);
+      await handleCallbackQuery(
+        { id: "cq1", data, message: { message_id: 50, chat: { id: 1111 } } },
+        baseEnv(mock.db)
+      );
+      return { calls: telegramCalls(fm), statements: mock.statements };
+    }
+
+    const find = (calls: TelegramCall[], method: string) => calls.find((c) => c.method === method)?.body;
+
+    it("del deletes the transaction and edits the message", async () => {
+      const { calls, statements } = await press("del:5");
+      const del = statements.find((st) => st.sql.includes("DELETE"));
+      expect(del?.bindings).toEqual([5, "1111"]);
+      expect(String(find(calls, "editMessageText")?.text)).toContain("Đã xoá");
+      expect(find(calls, "answerCallbackQuery")?.callback_query_id).toBe("cq1");
+    });
+
+    it("explains when the transaction no longer exists", async () => {
+      const { calls, statements } = await press("del:5", { firstResult: null });
+      expect(statements.some((st) => st.sql.includes("DELETE"))).toBe(false);
+      expect(String(find(calls, "answerCallbackQuery")?.text)).toContain("không còn");
+    });
+
+    it("cat opens the category picker and back restores the actions", async () => {
+      const cat = await press("cat:5");
+      const picker = (find(cat.calls, "editMessageReplyMarkup")?.reply_markup as SentMessage["reply_markup"])
+        ?.inline_keyboard.flat();
+      expect(picker).toHaveLength(9);
+      expect(picker?.[1]).toMatchObject({ text: "Mua sắm", callback_data: "setcat:5:1" });
+
+      const back = await press("back:5");
+      const actions = (find(back.calls, "editMessageReplyMarkup")?.reply_markup as SentMessage["reply_markup"])
+        ?.inline_keyboard.flat()
+        .map((b) => b.callback_data);
+      expect(actions).toContain("del:5");
+    });
+
+    it("setcat updates the category and refreshes the message", async () => {
+      const { calls, statements } = await press("setcat:5:1");
+      const upd = statements.find((st) => st.sql.includes("UPDATE expenses SET category"));
+      expect(upd?.bindings).toEqual(["Shopping", 5, "1111"]);
+      expect(String(find(calls, "editMessageText")?.text)).toContain("Mua sắm");
+    });
+
+    it("setcat ignores an out-of-range category", async () => {
+      const { statements } = await press("setcat:5:99");
+      expect(statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
+    });
+
+    it("card toggles between cash and credit card", async () => {
+      const toCard = await press("card:5");
+      const upd = toCard.statements.find((st) => st.sql.includes("payment_method = ?"));
+      expect(upd?.bindings).toEqual(["credit_card", 0, 5, "1111"]);
+      expect(String(find(toCard.calls, "editMessageText")?.text)).toContain("chưa trả");
+
+      const toCash = await press("card:5", { firstResult: { ...row, payment_method: "credit_card", is_paid: 0 } });
+      const upd2 = toCash.statements.find((st) => st.sql.includes("payment_method = ?"));
+      expect(upd2?.bindings).toEqual(["cash", 1, 5, "1111"]);
+    });
+
+    it("pay settles one bill, payall asks, payallok settles all, cancel dismisses", async () => {
+      const bills = { allResults: [{ id: 5, amount: 100000, description: "Dinner" }] };
+      const pay = await press("pay:5", bills);
+      expect(String(find(pay.calls, "sendMessage")?.text)).toContain("Đã ghi nhận thanh toán");
+
+      const ask = await press("payall", bills);
+      expect(String(find(ask.calls, "sendMessage")?.text)).toContain("Trả hết");
+
+      const ok = await press("payallok", bills);
+      expect(String(find(ok.calls, "editMessageText")?.text)).toContain("Đã ghi nhận thanh toán");
+
+      const cancel = await press("cancel");
+      expect(String(find(cancel.calls, "editMessageText")?.text)).toContain("Đã huỷ");
+    });
+
+    it("answers (and does nothing else) for malformed or message-less queries", async () => {
+      const fm = mockNetwork();
+      const env = baseEnv(createMockD1().db);
+      await handleCallbackQuery({ id: "x", data: "del:5" }, env);
+      await handleCallbackQuery({ id: "y", data: "weird", message: { message_id: 1, chat: { id: 1 } } }, env);
+      expect(telegramCalls(fm).every((c) => c.method === "answerCallbackQuery")).toBe(true);
+    });
+
+    it("surfaces callback failures as a toast without throwing", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const { calls } = await press("del:5", {
+        onExecute: () => {
+          throw new Error("D1 down");
+        },
+      });
+      expect(String(find(calls, "answerCallbackQuery")?.text)).toContain("Có lỗi xảy ra");
+    });
+
+    it("is routed from worker.fetch when a callback_query update arrives", async () => {
+      const fm = mockNetwork();
+      const { db } = createMockD1({ firstResult: row });
+      const res = await post(
+        { callback_query: { id: "cq9", data: "cat:5", message: { message_id: 3, chat: { id: 1111 } } } },
+        baseEnv(db)
+      );
+      expect(await res.text()).toBe("OK");
+      expect(telegramCalls(fm).map((c) => c.method)).toContain("editMessageReplyMarkup");
     });
   });
 
@@ -1326,385 +1313,141 @@ describe("Expense Bot Suite", () => {
   // 5. worker.fetch
   // ==========================================
   describe("worker.fetch()", () => {
-    it("returns 'Bot is running!' for non-POST HTTP methods (GET, PUT...)", async () => {
-      const { db } = createMockD1();
-      const env: Env = {
-        DB: db,
-        TELEGRAM_BOT_TOKEN: "tok_123",
-        GEMINI_API_KEY: "gem_123",
-      };
+    it("returns 'Bot is running!' for non-POST HTTP methods", async () => {
+      const env = baseEnv(createMockD1().db);
+      for (const method of ["GET", "PUT"]) {
+        const res = await worker.fetch(new Request("https://example.com/webhook", { method }), env);
+        expect(await res.text()).toBe("Bot is running!");
+      }
+    });
 
-      const getReq = new Request("https://example.com/webhook", { method: "GET" });
-      const getRes = await worker.fetch(getReq, env);
-      expect(await getRes.text()).toBe("Bot is running!");
-
-      const putReq = new Request("https://example.com/webhook", { method: "PUT" });
-      const putRes = await worker.fetch(putReq, env);
-      expect(await putRes.text()).toBe("Bot is running!");
+    it("returns HTTP 500 when env parameter is missing or undefined", async () => {
+      const res = await worker.fetch(new Request("https://example.com", { method: "POST" }), null as unknown as Env);
+      expect(res.status).toBe(500);
+      expect(await res.text()).toBe("Error: Worker environment is unconfigured");
     });
 
     // ------------------------------------------
     // Apple Shortcut Flow
     // ------------------------------------------
     describe("Apple Shortcut Flow", () => {
-      it("returns error if env.DB is not configured", async () => {
-        const envWithoutDb = {
-          DB: null as unknown as D1Database,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
+      const shortcut = (extra: Record<string, unknown> = {}) => ({ source: "shortcut", text: "Lunch 50k", ...extra });
 
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: "shortcut", text: "Coffee $3" }),
-        });
-
-        const res = await worker.fetch(req, envWithoutDb);
-        expect(await res.text()).toBe("Error: Database not configured");
-      });
-
-      it("returns error message if Gemini parsing fails", async () => {
-        const fetchMock = vi.fn().mockImplementation(() =>
-          Promise.resolve(
-            new Response(JSON.stringify({ error: { message: "API key expired" } }), {
-              status: 401,
-            })
-          )
-        );
-        globalThis.fetch = fetchMock;
-
-        const { db } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_invalid",
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: "shortcut", text: "Coffee $3" }),
-        });
-
-        const res = await worker.fetch(req, env);
-        const text = await res.text();
-        expect(text).toContain("⚠️ Error: AI service unavailable: API key expired");
-      });
-
-      it("returns warning message if Gemini fails to identify amount", async () => {
-        const fetchMock = vi.fn().mockResolvedValue(
-          new Response(
-            JSON.stringify({
-              candidates: [
-                {
-                  content: {
-                    parts: [{ text: JSON.stringify({ description: "Nice weather" }) }],
-                  },
-                },
-              ],
-            })
-          )
-        );
-        globalThis.fetch = fetchMock;
-
-        const { db } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: "shortcut", text: "Nice weather today" }),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("⚠️ Could not identify transaction amount.");
-      });
-
-      it("saves regular expense with default user_id 'iphone_user'", async () => {
-        const mockGeminiData = {
-          amount: 60000,
-          category: "Food & Dining",
-          description: "Chicken Pho",
-          transaction_type: "expense",
-        };
-
-        const fetchMock = vi.fn().mockResolvedValue(
-          new Response(
-            JSON.stringify({
-              candidates: [
-                {
-                  content: {
-                    parts: [{ text: JSON.stringify(mockGeminiData) }],
-                  },
-                },
-              ],
-            })
-          )
-        );
-        globalThis.fetch = fetchMock;
-
-        const { db, statements } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: "shortcut", text: "Chicken Pho 60k" }),
-        });
-
-        const res = await worker.fetch(req, env);
-        const text = await res.text();
-
-        expect(text).toContain("✅ Saved 🔴 Expense:");
-        expect(text).toContain("60,000");
-        expect(text).toContain("Food & Dining");
-        expect(text).toContain("Chicken Pho");
-
-        const insertStmt = statements.find((s) => s.sql.includes("INSERT INTO expenses"));
-        expect(insertStmt).toBeDefined();
-        expect(insertStmt?.bindings).toEqual([
-          "iphone_user",
-          60000,
-          "Food & Dining",
-          "Chicken Pho",
-          "cash",
-          1,
-        ]);
-      });
-
-      it("saves refund with custom user_id and negative amount", async () => {
-        const mockGeminiData = {
-          amount: 250000,
-          category: "Shopping",
-          description: "Hoodie refund",
-          transaction_type: "refund",
-        };
-
-        const fetchMock = vi.fn().mockResolvedValue(
-          new Response(
-            JSON.stringify({
-              candidates: [
-                {
-                  content: {
-                    parts: [{ text: JSON.stringify(mockGeminiData) }],
-                  },
-                },
-              ],
-            })
-          )
-        );
-        globalThis.fetch = fetchMock;
-
-        const { db, statements } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            source: "shortcut",
-            text: "Hoodie refund 250k",
-            user_id: "my_custom_user_id",
-          }),
-        });
-
-        const res = await worker.fetch(req, env);
-        const text = await res.text();
-
-        expect(text).toContain("✅ Saved 🟢 Refund / Cancellation:");
-        expect(text).toContain("250,000");
-
-        const insertStmt = statements.find((s) => s.sql.includes("INSERT INTO expenses"));
-        expect(insertStmt).toBeDefined();
-        expect(insertStmt?.bindings).toEqual([
-          "my_custom_user_id",
-          -250000,
-          "Shopping",
-          "Hoodie refund",
-          "cash",
-          1,
-        ]);
-      });
-
-      it("uses default values 'Other' and 'Transaction' when Gemini omits category or description", async () => {
-        const mockGeminiData = {
-          amount: 50000,
-          transaction_type: "expense",
-        };
-
-        const fetchMock = vi.fn().mockResolvedValue(
-          new Response(
-            JSON.stringify({
-              candidates: [
-                {
-                  content: {
-                    parts: [{ text: JSON.stringify(mockGeminiData) }],
-                  },
-                },
-              ],
-            })
-          )
-        );
-        globalThis.fetch = fetchMock;
-
-        const { db, statements } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: "shortcut", text: "50k" }),
-        });
-
-        const res = await worker.fetch(req, env);
-        const text = await res.text();
-
-        expect(text).toContain("🏷 Category: Other");
-        expect(text).toContain("📝 Description: Transaction");
-
-        const insertStmt = statements.find((s) => s.sql.includes("INSERT INTO expenses"));
-        expect(insertStmt?.bindings).toEqual([
-          "iphone_user",
-          50000,
-          "Other",
-          "Transaction",
-          "cash",
-          1,
-        ]);
-      });
-
-      it("saves credit card expense with is_paid = 0 and informs about /debt command", async () => {
-        const mockGeminiData = {
-          amount: 300000,
-          category: "Shopping",
-          description: "Zara jacket",
-          transaction_type: "expense",
-          payment_method: "credit_card",
-        };
-
-        const fetchMock = vi.fn().mockResolvedValue(
-          new Response(
-            JSON.stringify({
-              candidates: [
-                {
-                  content: {
-                    parts: [{ text: JSON.stringify(mockGeminiData) }],
-                  },
-                },
-              ],
-            })
-          )
-        );
-        globalThis.fetch = fetchMock;
-
-        const { db, statements } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: "shortcut", text: "Zara jacket 300k credit card" }),
-        });
-
-        const res = await worker.fetch(req, env);
-        const text = await res.text();
-
-        expect(text).toContain("💳 Credit Card Expense (Unpaid Debt)");
-        expect(text).toContain("300,000");
-        expect(text).toContain("/debt");
-
-        const insertStmt = statements.find((s) => s.sql.includes("INSERT INTO expenses"));
-        expect(insertStmt?.bindings).toEqual([
-          "iphone_user",
-          300000,
-          "Shopping",
-          "Zara jacket",
-          "credit_card",
-          0,
-        ]);
-      });
-
-      it("returns error response if text is empty or whitespace", async () => {
-        const { db } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: "shortcut", text: "   " }),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("⚠️ Error: Empty transaction text provided.");
-      });
-
-      it("returns HTTP 500 if database insert throws an exception", async () => {
-        vi.spyOn(console, "error").mockImplementation(() => {});
-        const fetchMock = vi.fn().mockResolvedValue(
-          new Response(
-            JSON.stringify({
-              candidates: [
-                {
-                  content: {
-                    parts: [{ text: JSON.stringify({ amount: 50000, category: "Food & Dining", description: "Snack" }) }],
-                  },
-                },
-              ],
-            })
-          )
-        );
-        globalThis.fetch = fetchMock;
-
-        const errorDb: D1Database = {
-          prepare: () => {
-            throw new Error("Disk full");
-          },
-          withSession: () => ({ prepare: () => ({} as D1PreparedStatement), batch: () => Promise.resolve([]), getBookmark: () => null }),
-          dump: async () => new ArrayBuffer(0),
-          batch: async () => [],
-          exec: async () => ({ count: 0, duration: 0 }),
-        };
-
-        const env: Env = {
-          DB: errorDb,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: "shortcut", text: "Snack 50k" }),
-        });
-
-        const res = await worker.fetch(req, env);
+      it("returns 500 if env.DB is not configured", async () => {
+        const res = await post(shortcut(), { TELEGRAM_BOT_TOKEN: "t", GEMINI_API_KEY: "g" } as unknown as Env);
         expect(res.status).toBe(500);
-        expect(await res.text()).toContain("⚠️ Error: Disk full");
+        expect(await res.text()).toContain("cơ sở dữ liệu");
+      });
+
+      it("returns 400 for empty text", async () => {
+        const fm = mockNetwork();
+        const res = await post(shortcut({ text: "   " }), baseEnv(createMockD1().db));
+        expect(res.status).toBe(400);
+        expect(fm).not.toHaveBeenCalled();
+      });
+
+      it("returns friendly, non-2xx errors when parsing fails", async () => {
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        mockNetwork({ gemini: { error: "cannot_parse", transactions: [] } });
+        const res = await post(shortcut(), baseEnv(createMockD1().db));
+        expect(res.status).toBe(422);
+        const text = await res.text();
+        expect(text).toContain("chưa hiểu");
+        expect(text).not.toContain("cannot_parse");
+        expect(text).not.toContain("<code>");
+
+        mockNetwork({ geminiStatus: 503 });
+        const busy = await post(shortcut(), baseEnv(createMockD1().db));
+        expect(busy.status).toBe(503);
+        expect(await busy.text()).toContain("quá tải");
+      });
+
+      it("returns 422 when no amount is found", async () => {
+        mockNetwork({ gemini: { transactions: [expenseItem({ amount: 0 })] } });
+        const res = await post(shortcut(), baseEnv(createMockD1().db));
+        expect(res.status).toBe(422);
+        expect(await res.text()).toContain("số tiền");
+      });
+
+      it("saves an expense under the default user with a plain-text reply", async () => {
+        mockNetwork({ gemini: { transactions: [expenseItem({ amount: 45000, description: "Lunch" })] } });
+        const { db, statements } = createMockD1();
+        const res = await post(shortcut(), baseEnv(db));
+        expect(res.status).toBe(200);
+        const text = await res.text();
+        expect(text).toContain("Đã ghi 🔴 Chi tiêu");
+        expect(text).toContain("45.000 ₫");
+        expect(text).not.toContain("<b>");
+        const insert = statements.find((st) => st.sql.includes("INSERT INTO expenses"));
+        expect(insert?.bindings).toEqual(["iphone_user", 45000, "Food & Dining", "Lunch", "cash", 1]);
+      });
+
+      it("stores under SHORTCUT_USER_ID, then ADMIN_CHAT_ID, unless user_id is sent", async () => {
+        const userOf = async (extra: Partial<Env>, body: Record<string, unknown> = {}) => {
+          mockNetwork({ gemini: { transactions: [expenseItem()] } });
+          const { db, statements } = createMockD1();
+          await post(shortcut(body), baseEnv(db, extra));
+          return statements.find((st) => st.sql.includes("INSERT INTO expenses"))?.bindings[0];
+        };
+        expect(await userOf({ ADMIN_CHAT_ID: "7777" })).toBe("7777");
+        expect(await userOf({ ADMIN_CHAT_ID: "7777", SHORTCUT_USER_ID: "8888" })).toBe("8888");
+        expect(await userOf({ ADMIN_CHAT_ID: "7777", SHORTCUT_USER_ID: "8888" }, { user_id: "alice" })).toBe("alice");
+      });
+
+      it("saves refunds as negative amounts", async () => {
+        mockNetwork({ gemini: { transactions: [expenseItem({ transaction_type: "refund", amount: 120000 })] } });
+        const { db, statements } = createMockD1();
+        const res = await post(shortcut(), baseEnv(db));
+        expect(await res.text()).toContain("Hoàn tiền");
+        const insert = statements.find((st) => st.sql.includes("INSERT INTO expenses"));
+        expect(insert?.bindings[1]).toBe(-120000);
+      });
+
+      it("falls back to 'Other' and 'Transaction' when category/description are missing", async () => {
+        mockNetwork({ gemini: { transactions: [{ amount: 1000, transaction_type: "expense" }] } });
+        const { db, statements } = createMockD1();
+        await post(shortcut(), baseEnv(db));
+        const insert = statements.find((st) => st.sql.includes("INSERT INTO expenses"));
+        expect(insert?.bindings.slice(2, 4)).toEqual(["Other", "Transaction"]);
+      });
+
+      it("records credit card spending as unpaid, from Gemini or the payload override", async () => {
+        const run = async (item: Record<string, unknown>, body: Record<string, unknown> = {}) => {
+          mockNetwork({ gemini: { transactions: [item] } });
+          const { db, statements } = createMockD1();
+          const res = await post(shortcut(body), baseEnv(db));
+          const insert = statements.find((st) => st.sql.includes("INSERT INTO expenses"));
+          return { text: await res.text(), bindings: insert?.bindings };
+        };
+        const viaAi = await run(expenseItem({ payment_method: "credit_card" }));
+        expect(viaAi.bindings?.slice(4)).toEqual(["credit_card", 0]);
+        expect(viaAi.text).toContain("/debt");
+        const viaPayload = await run(expenseItem(), { payment_method: "credit_card" });
+        expect(viaPayload.bindings?.slice(4)).toEqual(["credit_card", 0]);
+      });
+
+      it("records several transactions from one message", async () => {
+        mockNetwork({
+          gemini: { transactions: [expenseItem({ description: "Cafe", amount: 30000 }), expenseItem({ description: "Gửi xe", amount: 5000 })] },
+        });
+        const { db, statements } = createMockD1();
+        const text = await (await post(shortcut(), baseEnv(db))).text();
+        expect(statements.filter((st) => st.sql.includes("INSERT INTO expenses"))).toHaveLength(2);
+        expect(text).toContain("Cafe");
+        expect(text).toContain("Gửi xe");
+      });
+
+      it("returns HTTP 500 without leaking details if the insert fails", async () => {
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        const { db } = createMockD1({
+          onExecute: (st) => {
+            if (st.sql.includes("INSERT INTO expenses")) throw new Error("D1 exploded");
+          },
+        });
+        const res = await post(shortcut(), baseEnv(db));
+        expect(res.status).toBe(500);
+        expect(await res.text()).not.toContain("D1 exploded");
       });
     });
 
@@ -1712,621 +1455,234 @@ describe("Expense Bot Suite", () => {
     // Telegram Webhook Flow
     // ------------------------------------------
     describe("Telegram Webhook Flow", () => {
-      it("ignores updates without message or chat entity", async () => {
-        const { db } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
+      const textUpdate = (text = "Sandwich 35k", extra: Record<string, unknown> = {}) => ({
+        message: { chat: { id: 998877 }, text },
+        ...extra,
+      });
+      const inserts = (statements: ExecutedStatement[]) =>
+        statements.filter((st) => st.sql.includes("INSERT INTO expenses"));
 
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ update_id: 12345 }),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
+      it("ignores updates without a message or chat", async () => {
+        const fm = mockNetwork();
+        for (const update of [{}, { message: { text: "hi" } }]) {
+          expect(await (await post(update, baseEnv(createMockD1().db))).text()).toBe("OK");
+        }
+        expect(fm).not.toHaveBeenCalled();
       });
 
-      it("sends Telegram alert if env.DB is not configured", async () => {
-        const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-        globalThis.fetch = fetchMock;
-
-        const envWithoutDb = {
-          DB: null as unknown as D1Database,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 123456 },
-            text: "Coffee 25k",
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, envWithoutDb);
-        expect(await res.text()).toBe("OK");
-
-        expect(fetchMock).toHaveBeenCalledTimes(1);
-        const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-        const body = JSON.parse(init.body as string) as { text: string };
-        expect(body.text).toContain("Cloudflare D1 database is not connected.");
-      });
-
-      it("delegates to handleCommand when message starts with slash /", async () => {
-        const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
-        globalThis.fetch = fetchMock;
-
-        const { db } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 778899 },
-            text: "/start",
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
-
-        expect(fetchMock).toHaveBeenCalledTimes(1);
-        const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-        const body = JSON.parse(init.body as string) as { text: string };
-        expect(body.text).toContain("Available Commands:");
-      });
-
-      it("processes receipt photo message successfully (download -> Gemini Vision -> D1 -> reply)", async () => {
-        const mockBinaryData = new TextEncoder().encode("Mock Receipt Image");
-        const mockExpense = {
-          amount: 85000,
-          category: "Food & Dining",
-          description: "Highland Coffee Receipt",
-          transaction_type: "expense",
-        };
-
-        const fetchMock = vi
-          .fn()
-          // 1. Telegram getFile
-          .mockResolvedValueOnce(
-            new Response(
-              JSON.stringify({
-                ok: true,
-                result: { file_id: "photo_highland", file_path: "photos/highland.jpg" },
-              })
-            )
-          )
-          // 2. Download file
-          .mockResolvedValueOnce(new Response(mockBinaryData))
-          // 3. Gemini API
-          .mockResolvedValueOnce(
-            new Response(
-              JSON.stringify({
-                candidates: [
-                  {
-                    content: {
-                      parts: [{ text: JSON.stringify(mockExpense) }],
-                    },
-                  },
-                ],
-              })
-            )
-          )
-          // 4. Telegram sendMessage
-          .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })));
-
-        globalThis.fetch = fetchMock;
-
-        const { db, statements } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 556677 },
-            caption: "Morning coffee receipt",
-            photo: [
-              { file_id: "small_id", width: 100, height: 100 },
-              { file_id: "photo_highland", width: 800, height: 800 },
-            ],
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
-
-        expect(fetchMock).toHaveBeenCalledTimes(4);
-
-        const insertStmt = statements.find((s) => s.sql.includes("INSERT INTO expenses"));
-        expect(insertStmt).toBeDefined();
-        expect(insertStmt?.bindings).toEqual([
-          "556677",
-          85000,
-          "Food & Dining",
-          "Highland Coffee Receipt",
-          "cash",
-          1,
-        ]);
-
-        const lastCall = fetchMock.mock.calls[3] as [string, RequestInit];
-        expect(lastCall[0]).toBe("https://api.telegram.org/bottok_123/sendMessage");
-        const replyBody = JSON.parse(lastCall[1].body as string) as {
-          chat_id: number;
-          text: string;
-        };
-        expect(replyBody.chat_id).toBe(556677);
-        expect(replyBody.text).toContain("✅ **Recorded 🔴 Expense:**");
-        expect(replyBody.text).toContain("85,000");
-      });
-
-      it("processes text message expense successfully", async () => {
-        const mockExpense = {
-          amount: 35000,
-          category: "Food & Dining",
-          description: "Sandwich",
-          transaction_type: "expense",
-        };
-
-        const fetchMock = vi
-          .fn()
-          // 1. Gemini API
-          .mockResolvedValueOnce(
-            new Response(
-              JSON.stringify({
-                candidates: [
-                  {
-                    content: {
-                      parts: [{ text: JSON.stringify(mockExpense) }],
-                    },
-                  },
-                ],
-              })
-            )
-          )
-          // 2. Telegram sendMessage
-          .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })));
-
-        globalThis.fetch = fetchMock;
-
-        const { db, statements } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 998877 },
-            text: "Sandwich 35k",
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
-
-        expect(fetchMock).toHaveBeenCalledTimes(2);
-
-        const insertStmt = statements.find((s) => s.sql.includes("INSERT INTO expenses"));
-        expect(insertStmt?.bindings).toEqual([
-          "998877",
-          35000,
-          "Food & Dining",
-          "Sandwich",
-          "cash",
-          1,
-        ]);
-
-        const telegramCall = fetchMock.mock.calls[1] as [string, RequestInit];
-        const replyBody = JSON.parse(telegramCall[1].body as string) as { text: string };
-        expect(replyBody.text).toContain("✅ **Recorded 🔴 Expense:**");
-      });
-
-      it("processes refund / cancellation text message successfully", async () => {
-        const mockExpense = {
-          amount: 120000,
-          category: "Shopping",
-          description: "Shopee order refund",
-          transaction_type: "refund",
-        };
-
-        const fetchMock = vi
-          .fn()
-          // 1. Gemini API
-          .mockResolvedValueOnce(
-            new Response(
-              JSON.stringify({
-                candidates: [
-                  {
-                    content: {
-                      parts: [{ text: JSON.stringify(mockExpense) }],
-                    },
-                  },
-                ],
-              })
-            )
-          )
-          // 2. Telegram sendMessage
-          .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })));
-
-        globalThis.fetch = fetchMock;
-
-        const { db, statements } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 998877 },
-            text: "Shopee refund 120k",
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
-
-        const insertStmt = statements.find((s) => s.sql.includes("INSERT INTO expenses"));
-        expect(insertStmt?.bindings).toEqual([
-          "998877",
-          -120000,
-          "Shopping",
-          "Shopee order refund",
-          "cash",
-          1,
-        ]);
-
-        const telegramCall = fetchMock.mock.calls[1] as [string, RequestInit];
-        const replyBody = JSON.parse(telegramCall[1].body as string) as { text: string };
-        expect(replyBody.text).toContain("✅ **Recorded 🟢 Refund (Cost Reduction):**");
-      });
-
-      it("processes credit card expense text message with is_paid = 0 and informs about /debt command", async () => {
-        const mockExpense = {
-          amount: 500000,
-          category: "Bills & Utilities",
-          description: "Electricity bill",
-          transaction_type: "expense",
-          payment_method: "credit_card",
-        };
-
-        const fetchMock = vi
-          .fn()
-          .mockResolvedValueOnce(
-            new Response(
-              JSON.stringify({
-                candidates: [{ content: { parts: [{ text: JSON.stringify(mockExpense) }] } }],
-              })
-            )
-          )
-          .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })));
-
-        globalThis.fetch = fetchMock;
-
-        const { db, statements } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 998877 },
-            text: "Electricity 500k credit card",
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
-
-        const insertStmt = statements.find((s) => s.sql.includes("INSERT INTO expenses"));
-        expect(insertStmt?.bindings).toEqual([
-          "998877",
-          500000,
-          "Bills & Utilities",
-          "Electricity bill",
-          "credit_card",
-          0,
-        ]);
-
-        const telegramCall = fetchMock.mock.calls[1] as [string, RequestInit];
-        const replyBody = JSON.parse(telegramCall[1].body as string) as { text: string };
-        expect(replyBody.text).toContain("✅ **Recorded 💳 Credit Card Expense (Unpaid Debt):**");
-        expect(replyBody.text).toContain("/debt");
-      });
-
-      it("sends warning notification when Gemini returns recognition error", async () => {
-        const fetchMock = vi
-          .fn()
-          .mockResolvedValueOnce(
-            new Response(JSON.stringify({ error: { message: "Internal quota" } }), {
-              status: 500,
-            })
-          )
-          .mockResolvedValueOnce(
-            new Response(JSON.stringify({ error: { message: "Internal quota 2" } }), {
-              status: 500,
-            })
-          )
-          .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })));
-
-        globalThis.fetch = fetchMock;
-
-        const { db, statements } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 112233 },
-            text: "Some random text",
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
-
-        expect(statements.filter((s) => s.sql.includes("INSERT"))).toHaveLength(0);
-
-        const lastCall = fetchMock.mock.calls[2] as [string, RequestInit];
-        const replyBody = JSON.parse(lastCall[1].body as string) as { text: string };
-        expect(replyBody.text).toContain("⚠️ Recognition error:");
-      });
-
-      it("sends warning notification when Gemini fails to identify amount", async () => {
-        const fetchMock = vi
-          .fn()
-          .mockResolvedValueOnce(
-            new Response(
-              JSON.stringify({
-                candidates: [
-                  {
-                    content: {
-                      parts: [{ text: JSON.stringify({ description: "Hello" }) }],
-                    },
-                  },
-                ],
-              })
-            )
-          )
-          .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })));
-
-        globalThis.fetch = fetchMock;
-
-        const { db, statements } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 112233 },
-            text: "Hello there",
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
-
-        expect(statements.filter((s) => s.sql.includes("INSERT"))).toHaveLength(0);
-
-        const lastCall = fetchMock.mock.calls[1] as [string, RequestInit];
-        const replyBody = JSON.parse(lastCall[1].body as string) as { text: string };
-        expect(replyBody.text).toBe("⚠️ Could not identify transaction amount.");
-      });
-
-      it("ignores messages that contain neither text nor photo", async () => {
-        const fetchMock = vi.fn();
-        globalThis.fetch = fetchMock;
-
-        const { db } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 112233 },
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
-        expect(fetchMock).not.toHaveBeenCalled();
-      });
-
-      it("catches parsing exception and does not crash worker when JSON payload is invalid", async () => {
+      it("does not crash on an invalid JSON body", async () => {
         vi.spyOn(console, "error").mockImplementation(() => {});
-
-        const { db } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "invalid-json{{{{",
-        });
-
-        const res = await worker.fetch(req, env);
+        const res = await worker.fetch(
+          new Request("https://example.com", { method: "POST", body: "{not json" }),
+          baseEnv(createMockD1().db)
+        );
         expect(await res.text()).toBe("OK");
       });
-    });
 
-      it("informs user when photo download fails", async () => {
+      it("alerts the user if env.DB is not configured", async () => {
+        const fm = mockNetwork();
+        await post(textUpdate(), { TELEGRAM_BOT_TOKEN: "t", GEMINI_API_KEY: "g" } as unknown as Env);
+        expect(sentMessages(fm)[0].text).toContain("cơ sở dữ liệu");
+      });
+
+      it("delegates slash commands to handleCommand", async () => {
+        const fm = mockNetwork();
+        await post(textUpdate("/help"), baseEnv(createMockD1().db));
+        expect(sentMessages(fm)[0].text).toContain("Hướng dẫn sử dụng");
+      });
+
+      it("records a text expense, shows typing first and attaches action buttons", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        const { db, statements } = createMockD1({ runMeta: { last_row_id: 42 } });
+
+        const res = await post(textUpdate(), baseEnv(db));
+        expect(await res.text()).toBe("OK");
+
+        expect(inserts(statements)[0].bindings).toEqual(["998877", 35000, "Food & Dining", "Sandwich", "cash", 1]);
+        const methods = telegramCalls(fm).map((c) => c.method);
+        expect(methods[0]).toBe("sendChatAction");
+        expect(telegramCalls(fm)[0].body.action).toBe("typing");
+
+        const [reply] = sentMessages(fm);
+        expect(reply.text).toContain("<b>Đã ghi 🔴 Chi tiêu</b>");
+        expect(reply.text).toContain("35.000 ₫");
+        expect(reply.text).toContain("Ăn uống");
+        expect(buttons(reply)).toEqual(["del:42", "cat:42", "card:42"]);
+      });
+
+      it("omits buttons when the row id is unknown", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        await post(textUpdate(), baseEnv(createMockD1().db));
+        expect(sentMessages(fm)[0].reply_markup).toBeUndefined();
+      });
+
+      it("still understands the legacy flat Gemini object", async () => {
+        const fm = mockNetwork({ gemini: expenseItem({ amount: 20000 }) });
+        const { db, statements } = createMockD1();
+        await post(textUpdate(), baseEnv(db));
+        expect(inserts(statements)[0].bindings[1]).toBe(20000);
+        expect(sentMessages(fm)[0].text).toContain("20.000 ₫");
+      });
+
+      it("records every transaction found in one message", async () => {
+        const fm = mockNetwork({
+          gemini: { transactions: [expenseItem({ description: "Cafe", amount: 30000 }), expenseItem({ description: "Gửi xe", amount: 5000 })] },
+        });
+        const { db, statements } = createMockD1({ runMeta: { last_row_id: 1 } });
+        await post(textUpdate("Cafe 30k, gửi xe 5k"), baseEnv(db));
+        expect(inserts(statements)).toHaveLength(2);
+        expect(sentMessages(fm)).toHaveLength(2);
+      });
+
+      it("records refunds with a negative amount and no card toggle", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem({ transaction_type: "refund", amount: 100000 })] } });
+        const { db, statements } = createMockD1({ runMeta: { last_row_id: 9 } });
+        await post(textUpdate("Hoàn Shopee 100k"), baseEnv(db));
+        expect(inserts(statements)[0].bindings[1]).toBe(-100000);
+        const [reply] = sentMessages(fm);
+        expect(reply.text).toContain("Hoàn tiền");
+        expect(buttons(reply)).toEqual(["del:9", "cat:9"]);
+      });
+
+      it("records credit card expenses as unpaid debt", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem({ payment_method: "credit_card", amount: 300000 })] } });
+        const { db, statements } = createMockD1({ runMeta: { last_row_id: 3 } });
+        await post(textUpdate("Dinner 300k quẹt thẻ"), baseEnv(db));
+        expect(inserts(statements)[0].bindings.slice(4)).toEqual(["credit_card", 0]);
+        const [reply] = sentMessages(fm);
+        expect(reply.text).toContain("chưa trả");
+        expect(reply.text).toContain("/debt");
+        expect(buttons(reply)).toContain("card:3");
+      });
+
+      it("back-dates a transaction mentioned for a past day, and ignores future dates", async () => {
+        const yesterday = localDateOffset(-1);
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem({ date: yesterday })] } });
+        const past = createMockD1();
+        await post(textUpdate("Hôm qua ăn phở 35k"), baseEnv(past.db));
+        const insert = inserts(past.statements)[0];
+        expect(insert.sql).toContain("created_at");
+        expect(insert.bindings.at(-1)).toBe(`${yesterday} 05:00:00`);
+        expect(sentMessages(fm)[0].text).toContain("Ngày:");
+
+        mockNetwork({ gemini: { transactions: [expenseItem({ date: localDateOffset(3) })] } });
+        const future = createMockD1();
+        await post(textUpdate(), baseEnv(future.db));
+        expect(inserts(future.statements)[0].bindings).toHaveLength(6);
+      });
+
+      it("escapes user-controlled text in replies", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem({ description: "<b>Grab_food</b> & *co*" })] } });
+        await post(textUpdate(), baseEnv(createMockD1().db));
+        expect(sentMessages(fm)[0].text).toContain("&lt;b&gt;Grab_food&lt;/b&gt; &amp; *co*");
+      });
+
+      it("shows friendly messages for unrecognized input, hiding raw error codes", async () => {
         vi.spyOn(console, "error").mockImplementation(() => {});
-        const fetchMock = vi
-          .fn()
-          .mockResolvedValueOnce(new Response("Not found", { status: 404 }))
-          .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })));
+        const fm = mockNetwork({ gemini: { error: "cannot_parse", transactions: [] } });
+        await post(textUpdate("xin chào"), baseEnv(createMockD1().db));
+        const text = sentMessages(fm)[0].text;
+        expect(text).toContain("chưa hiểu");
+        expect(text).not.toContain("cannot_parse");
 
-        globalThis.fetch = fetchMock;
-
-        const { db } = createMockD1();
-        const env: Env = {
-          DB: db,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 777888 },
-            photo: [{ file_id: "broken_photo", width: 100, height: 100 }],
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
-
-        expect(fetchMock).toHaveBeenCalledTimes(2);
-        const secondCall = fetchMock.mock.calls[1] as [string, RequestInit];
-        const body = JSON.parse(secondCall[1].body as string) as { text: string };
-        expect(body.text).toContain("Failed to download receipt image");
+        const busy = mockNetwork({ geminiStatus: 503 });
+        await post(textUpdate(), baseEnv(createMockD1().db));
+        expect(sentMessages(busy)[0].text).toContain("quá tải");
+        expect(sentMessages(busy)[0].text).not.toContain("busy");
       });
 
-      it("informs user when database insert throws an error", async () => {
+      it("asks for the amount when Gemini finds none", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem({ amount: 0 })] } });
+        const { db, statements } = createMockD1();
+        await post(textUpdate(), baseEnv(db));
+        expect(sentMessages(fm)[0].text).toContain("số tiền");
+        expect(inserts(statements)).toHaveLength(0);
+      });
+
+      it("processes a receipt photo (download -> Gemini Vision -> D1 -> reply)", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem({ description: "Receipt" })] } });
+        const { db, statements } = createMockD1();
+        await post(
+          { message: { chat: { id: 5 }, caption: "Highlands", photo: [{ file_id: "small" }, { file_id: "large" }] } },
+          baseEnv(db)
+        );
+
+        const getFile = fm.mock.calls.find(([u]) => String(u).includes("getFile"))?.[0];
+        expect(String(getFile)).toContain("file_id=large");
+        const gemini = fm.mock.calls.find(([u]) => String(u).includes(":generateContent"));
+        const parts = (JSON.parse(String(gemini?.[1]?.body)) as { contents: Array<{ parts: Array<Record<string, unknown>> }> })
+          .contents[0].parts;
+        expect(parts[0].text).toBe("Highlands");
+        expect(parts[1].inline_data).toMatchObject({ mime_type: "image/jpeg" });
+        expect(inserts(statements)).toHaveLength(1);
+        expect(sentMessages(fm)[0].text).toContain("Receipt");
+      });
+
+      it("also accepts images sent as a file (document)", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        await post(
+          { message: { chat: { id: 5 }, document: { file_id: "doc1", mime_type: "image/png" } } },
+          baseEnv(createMockD1().db)
+        );
+        const gemini = fm.mock.calls.find(([u]) => String(u).includes(":generateContent"));
+        expect(String(gemini?.[1]?.body)).toContain('"mime_type":"image/png"');
+        expect(sentMessages(fm)[0].text).toContain("Đã ghi");
+      });
+
+      it("tells the user when the photo cannot be downloaded", async () => {
         vi.spyOn(console, "error").mockImplementation(() => {});
-        const fetchMock = vi
-          .fn()
-          .mockResolvedValueOnce(
-            new Response(
-              JSON.stringify({
-                candidates: [
-                  { content: { parts: [{ text: JSON.stringify({ amount: 45000, category: "Food & Dining", description: "Pho" }) }] } },
-                ],
-              })
-            )
-          )
-          .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })));
-
-        globalThis.fetch = fetchMock;
-
-        const errorDb: D1Database = {
-          prepare: () => {
-            throw new Error("D1 insert timeout");
-          },
-          withSession: () => ({ prepare: () => ({} as D1PreparedStatement), batch: () => Promise.resolve([]), getBookmark: () => null }),
-          dump: async () => new ArrayBuffer(0),
-          batch: async () => [],
-          exec: async () => ({ count: 0, duration: 0 }),
-        };
-
-        const env: Env = {
-          DB: errorDb,
-          TELEGRAM_BOT_TOKEN: "tok_123",
-          GEMINI_API_KEY: "gem_123",
-        };
-
-        const update: WebhookUpdate = {
-          message: {
-            chat: { id: 334455 },
-            text: "Pho 45k",
-          },
-        };
-
-        const req = new Request("https://example.com", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(update),
-        });
-
-        const res = await worker.fetch(req, env);
-        expect(await res.text()).toBe("OK");
-
-        const lastCall = fetchMock.mock.calls[1] as [string, RequestInit];
-        const body = JSON.parse(lastCall[1].body as string) as { text: string };
-        expect(body.text).toContain("Failed to save transaction to database");
+        const fm = mockNetwork({ getFileStatus: 500 });
+        await post({ message: { chat: { id: 5 }, photo: [{ file_id: "p" }] } }, baseEnv(createMockD1().db));
+        expect(sentMessages(fm)[0].text).toContain("không tải được ảnh");
       });
 
-    it("returns HTTP 500 when env parameter is missing or undefined", async () => {
-      const req = new Request("https://example.com", { method: "POST" });
-      const res = await worker.fetch(req, null as unknown as Env);
-      expect(res.status).toBe(500);
-      expect(await res.text()).toBe("Error: Worker environment is unconfigured");
+      it("replies to unsupported content (stickers, non-image files) instead of staying silent", async () => {
+        const fm = mockNetwork();
+        await post({ message: { chat: { id: 5 }, sticker: {} } }, baseEnv(createMockD1().db));
+        await post(
+          { message: { chat: { id: 5 }, document: { file_id: "d", mime_type: "application/pdf" } } },
+          baseEnv(createMockD1().db)
+        );
+        const messages = sentMessages(fm);
+        expect(messages).toHaveLength(2);
+        expect(messages.every((m) => m.text.includes("văn bản và ảnh"))).toBe(true);
+      });
+
+      it("informs the user when the database insert fails", async () => {
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        const { db } = createMockD1({
+          onExecute: (st) => {
+            if (st.sql.includes("INSERT INTO expenses")) throw new Error("D1 down");
+          },
+        });
+        await post(textUpdate(), baseEnv(db));
+        expect(sentMessages(fm)[0].text).toContain("Không lưu được");
+      });
+
+      it("skips an update_id that was already claimed (Telegram retry)", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        const retry = createMockD1({ runMeta: { changes: 0 } });
+        expect(await (await post(textUpdate("x", { update_id: 10 }), baseEnv(retry.db))).text()).toBe("OK");
+        expect(fm).not.toHaveBeenCalled();
+        expect(inserts(retry.statements)).toHaveLength(0);
+
+        const fresh = createMockD1({ runMeta: { changes: 1 } });
+        await post(textUpdate("x", { update_id: 11 }), baseEnv(fresh.db));
+        expect(inserts(fresh.statements)).toHaveLength(1);
+      });
+
+      it("processes in ctx.waitUntil so the webhook returns without waiting", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        const pending: Promise<unknown>[] = [];
+        const ctx = { waitUntil: (p: Promise<unknown>) => void pending.push(p) } as unknown as ExecutionContext;
+
+        const res = await post(textUpdate(), baseEnv(createMockD1().db), ctx);
+        expect(await res.text()).toBe("OK");
+        expect(pending).toHaveLength(1);
+        await Promise.all(pending);
+        expect(sentMessages(fm)).toHaveLength(1);
+      });
     });
   });
 });

@@ -14,8 +14,11 @@
 - **🔄 Expense & Refund Tracking**: Distinguishes between normal expenses (🔴) and refunds/order cancellations (🟢), automatically calculating net totals.
 - **📊 Timezone-Aware Reporting**: Converts UTC timestamps to local calendar time (UTC+7) for accurate daily (`/today`) and monthly category breakdowns (`/month`).
 - **📱 Apple Shortcuts Integration**: Direct webhook endpoint (`source: "shortcut"`) allowing 1-tap expense logging via iPhone Action Button, Siri, or Share Sheet with instant notifications.
+- **🖱 Inline buttons & feedback**: undo / change category / toggle credit card under each entry, "typing…" indicator while the AI works, friendly Vietnamese messages and HTML-safe formatting.
+- **🧾 Multi-transaction & back-dated entries**: one message can record several purchases and dates such as "hôm qua".
+- **🔁 Safe webhook**: replies immediately (`ctx.waitUntil`) and ignores Telegram retries by `update_id`.
 - **⚡ Serverless & Global**: Runs on Cloudflare's global edge network with sub-second execution and Cloudflare D1 distributed SQLite storage.
-- **🛡️ 100% Type-Safe & Clean Architecture**: Strict TypeScript without `any` types, modular structure (services, handlers, formatters), and 73+ comprehensive unit tests with Vitest.
+- **🛡️ 100% Type-Safe & Clean Architecture**: Strict TypeScript without `any` types, modular structure (services, handlers, formatters), and 110+ comprehensive unit tests with Vitest.
 
 ---
 
@@ -23,13 +26,20 @@
 
 | Command | Aliases | Description | Example |
 | :--- | :--- | :--- | :--- |
-| `/start`, `/help` | `/trogiup` | Display the interactive help menu and available commands | `/help` |
-| `/today` | `/homnay` | View today's transactions, category breakdowns, and net total | `/today` |
-| `/month` | `/thismonth`, `/thangnay` | Monthly expense report grouped by category with net spending | `/month` |
-| `/debt` | `/credit`, `/nothe` | List all unpaid credit card bills and total outstanding debt | `/debt` |
-| `/pay <id\|ids\|all>` | `/trano`, `/paydebt` | Mark specific or all credit card bills as settled/paid | `/pay 5`<br>`/pay 5, 8`<br>`/pay all` |
-| `/model` | `/gemini` | View active Gemini model, switch models, or auto-sync from Google API | `/model`<br>`/model auto`<br>`/model gemini-3.5-flash`<br>`/model reset` |
-| `/delete` | `/xoa` | Undo / delete the most recent recorded transaction | `/delete` |
+| `/start` | | Welcome message; also registers the "/" command menu in Telegram | `/start` |
+| `/help` | `/trogiup` | Usage guide (`/model` is only listed for the admin) | `/help` |
+| `/today` | `/homnay` | Today's transactions and net total | `/today` |
+| `/week` | `/tuan` | Spending of the last 7 days by category | `/week` |
+| `/month [prev\|YYYY-MM]` | `/thismonth`, `/thangnay` | Monthly report by category with share bars and credit card totals | `/month`<br>`/month prev`<br>`/month 2026-09` |
+| `/recent` | `/gannhat` | The 10 latest transactions with their IDs | `/recent` |
+| `/debt` | `/credit`, `/nothe` | Unpaid credit card bills, with one-tap pay buttons | `/debt` |
+| `/pay <id\|ids\|all>` | `/trano`, `/paydebt` | Settle bills (`all` asks for confirmation first) | `/pay 5`<br>`/pay 5, 8`<br>`/pay all` |
+| `/delete [id]` | `/xoa` | Delete the latest (or a specific) transaction after confirming | `/delete`<br>`/delete 12` |
+| `/model` | `/gemini` | View active Gemini model, switch models, or auto-sync (admin only to change) | `/model`<br>`/model auto`<br>`/model reset` |
+
+### Inline Buttons
+
+Every recorded transaction comes with buttons: **↩️ Undo**, **🏷 Change category** and **💳 Mark as credit card / 💵 Switch to cash**, so AI mistakes can be fixed in one tap.
 
 ### Natural Language Examples
 
@@ -37,6 +47,8 @@ You can record transactions simply by messaging the bot:
 
 - **Regular Expense**: `Lunch 50k` or `Coffee $3.5`
 - **Receipt Photo**: Take a photo of an invoice or receipt and send it to the bot (optional caption)
+- **Several at once**: `Coffee 30k, parking 5k`
+- **Back-dated**: `Yesterday bought a book 120k`
 - **Credit Card Purchase**: `Zara jacket 450k credit card` or `Dinner 250k quẹt thẻ`
 - **Refund / Cancellation**: `Shopee refund 120k` or `Flight cancellation refund $200`
 
@@ -51,10 +63,13 @@ expense-bot/
 │       └── deploy.yml          # GitHub Actions CI/CD pipeline
 ├── src/
 │   ├── constants.ts            # System prompts, Gemini models, schema & defaults
-│   ├── formatters.ts           # Shared currency and number formatting helpers
+│   ├── formatters.ts           # vi-VN currency, date and HTML-escape helpers
+│   ├── messages.ts             # User-facing texts (Vietnamese), keyboards and message renderers
 │   ├── types.ts                # TypeScript domain models and interfaces
 │   ├── handlers/
+│   │   ├── callbacks.ts        # Inline button handlers (undo, category, credit card, pay)
 │   │   ├── commands.ts         # Telegram slash command handlers (/today, /debt, /pay...)
+│   │   ├── record.ts           # Gemini output -> transactions (multi-item, refunds, back-dating)
 │   │   ├── shortcut.ts         # Apple Shortcuts webhook handler
 │   │   └── telegram.ts         # Telegram webhook message & photo handler
 │   ├── services/
@@ -63,7 +78,7 @@ expense-bot/
 │   │   └── telegram.ts         # Telegram Bot API client & CDN photo downloader
 │   └── index.ts                # Cloudflare Worker fetch entry point & routing
 ├── test/
-│   ├── index.spec.ts           # Comprehensive Vitest unit test suite (73 tests)
+│   ├── index.spec.ts           # Comprehensive Vitest unit test suite (110+ tests)
 │   └── tsconfig.json           # Test TypeScript configuration
 ├── schema.sql                  # SQLite table definitions and indexes for D1
 ├── wrangler.jsonc              # Cloudflare Wrangler worker configuration
@@ -135,6 +150,12 @@ npx wrangler secret put GEMINI_API_KEY
 npx wrangler secret put ADMIN_CHAT_ID
 ```
 
+Optionally, store Apple Shortcut entries under your Telegram chat so they appear in `/today`, `/month` and `/debt` (defaults to `ADMIN_CHAT_ID` when unset):
+
+```bash
+npx wrangler secret put SHORTCUT_USER_ID
+```
+
 > `app_config` must exist in D1 (it is part of `schema.sql`); re-run the schema on existing databases.
 
 ### 5. Deploy to Cloudflare Workers
@@ -178,8 +199,9 @@ You can log expenses directly from iOS or macOS without opening Telegram:
      - **Request Body**: `JSON`
        - `source` (Text): `shortcut`
        - `text` (Text): `Provided Input`
-       - `user_id` (Text, optional): `<your-name>`
-   - **Show Notification**: Display the text returned from the URL.
+       - `user_id` (Text, optional): your Telegram chat ID. Leave it out to use `SHORTCUT_USER_ID` / `ADMIN_CHAT_ID`, otherwise entries are stored separately from Telegram's
+       - `payment_method` (Text, optional): `credit_card`
+   - **Show Notification**: Display the text returned from the URL (errors use HTTP 4xx/5xx, so you can branch on the status code).
 3. Assign the shortcut to your iPhone's **Action Button**, **Back Tap**, or home screen widget!
 
 ---

@@ -10,6 +10,8 @@ export interface Env {
   GEMINI_API_KEY: string;
   /** Telegram chat ID allowed to change the global Gemini model (/model). If unset, changes are disabled. */
   ADMIN_CHAT_ID?: string;
+  /** User ID that Apple Shortcut requests are stored under when they send no user_id. Defaults to ADMIN_CHAT_ID. */
+  SHORTCUT_USER_ID?: string;
 }
 
 /** Transaction classification: regular expense or refund/cancellation */
@@ -29,6 +31,10 @@ export interface ExpenseData {
   transaction_type?: string;
   /** Payment method: "cash" or "credit_card" */
   payment_method?: string;
+  /** Transaction date (YYYY-MM-DD) when stated in the input */
+  date?: string;
+  /** All transactions found in the input (a single flat object is also accepted) */
+  transactions?: ExpenseData[];
   /** Error code or message if parsing fails */
   error?: string;
 }
@@ -56,6 +62,26 @@ export interface TelegramMessage {
   text?: string;
   caption?: string;
   photo?: TelegramPhotoSize[];
+  /** File sent as a document (images sent "as file" arrive here) */
+  document?: TelegramPhotoSize & { mime_type?: string };
+}
+
+/** Telegram inline keyboard button press */
+export interface TelegramCallbackQuery {
+  id: string;
+  data?: string;
+  message?: TelegramMessage;
+}
+
+/** Telegram inline keyboard button definition */
+export interface InlineButton {
+  text: string;
+  callback_data: string;
+}
+
+/** Telegram inline keyboard markup */
+export interface InlineKeyboard {
+  inline_keyboard: InlineButton[][];
 }
 
 /**
@@ -64,6 +90,8 @@ export interface TelegramMessage {
  * - Telegram Webhook: contains message object.
  */
 export interface WebhookUpdate {
+  update_id?: number;
+  callback_query?: TelegramCallbackQuery;
   source?: string;
   text?: string;
   user_id?: string;

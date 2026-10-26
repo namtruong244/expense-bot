@@ -10,6 +10,7 @@ import {
   MAX_GEMINI_ATTEMPTS,
   SYSTEM_PROMPT,
 } from "../constants";
+import { localToday } from "../formatters";
 import { getConfigs, setConfig } from "./db";
 
 /** Model name fragments that are not usable for text/vision JSON extraction. */
@@ -127,6 +128,17 @@ export async function resolveGeminiModelSequence(db?: D1Database): Promise<strin
   return Array.from(new Set(sequence)).slice(0, MAX_GEMINI_ATTEMPTS);
 }
 
+/** Coerces `amount` to a positive finite number, or removes it when it is not numeric. */
+function normalizeAmount(data: ExpenseData): void {
+  if (data.amount === undefined) return;
+  const num = Number(data.amount);
+  if (Number.isFinite(num)) {
+    data.amount = Math.abs(num);
+  } else {
+    delete data.amount;
+  }
+}
+
 /**
  * Sends message text or image payload to Google Gemini API to parse financial transaction details.
  * Dynamically resolves model sequence and automatically falls back if primary models are busy or deprecated.
@@ -154,7 +166,9 @@ export async function parseWithGemini(
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+          system_instruction: {
+            parts: [{ text: `${SYSTEM_PROMPT}\nToday's date (UTC+7) is ${localToday()}.` }],
+          },
           generationConfig: {
             response_mime_type: "application/json",
             response_schema: GEMINI_EXPENSE_SCHEMA,
@@ -199,13 +213,12 @@ export async function parseWithGemini(
       }
 
       const expenseData = parsed as ExpenseData;
-      if (expenseData.amount !== undefined) {
-        const num = Number(expenseData.amount);
-        if (Number.isFinite(num)) {
-          expenseData.amount = Math.abs(num);
-        } else {
-          delete expenseData.amount;
-        }
+      normalizeAmount(expenseData);
+      if (Array.isArray(expenseData.transactions)) {
+        expenseData.transactions = expenseData.transactions.filter(
+          (t): t is ExpenseData => !!t && typeof t === "object" && !Array.isArray(t)
+        );
+        expenseData.transactions.forEach(normalizeAmount);
       }
       return expenseData;
     } catch (err: unknown) {

@@ -1,30 +1,40 @@
-import { DEFAULT_CATEGORY, DEFAULT_DESCRIPTION, DEFAULT_USER_ID } from "../constants";
-import { formatCurrency } from "../formatters";
-import { insertExpense } from "../services/db";
+import { DEFAULT_USER_ID } from "../constants";
+import { stripHtml } from "../formatters";
+import { friendlyParseError, MSG, savedText } from "../messages";
 import { parseWithGemini } from "../services/gemini";
 import { Env, GeminiPayload, WebhookUpdate } from "../types";
+import { buildTransactions, saveTransaction } from "./record";
+
+function reply(message: string, status = 200): Response {
+  return new Response(message, { status });
+}
 
 /**
  * Handles incoming webhook requests from Apple Shortcuts (iOS / macOS).
+ * Replies are plain text; failures use a non-2xx status so the Shortcut can tell them apart.
  *
  * Expected payload:
  * {
  *   "source": "shortcut",
  *   "text": "Lunch 50k",
- *   "user_id": "optional_user_identifier"
+ *   "user_id": "optional_user_identifier",
+ *   "payment_method": "optional: credit_card"
  * }
+ *
+ * Without `user_id`, records are stored under SHORTCUT_USER_ID, then ADMIN_CHAT_ID, so they show up
+ * in the same /today, /month and /debt reports as Telegram messages.
  */
 export async function handleShortcut(
   update: WebhookUpdate,
   env: Env
 ): Promise<Response> {
   if (!env.DB) {
-    return new Response("Error: Database not configured");
+    return reply("⚠️ Lỗi: chưa kết nối được cơ sở dữ liệu.", 500);
   }
 
   const text = (update.text || "").trim();
   if (!text) {
-    return new Response("⚠️ Error: Empty transaction text provided.");
+    return reply("⚠️ Bạn chưa nhập nội dung giao dịch.", 400);
   }
 
   try {
@@ -32,37 +42,30 @@ export async function handleShortcut(
     const expense = await parseWithGemini(aiPayload, env.GEMINI_API_KEY, env.DB);
 
     if (expense.error) {
-      return new Response(`⚠️ Error: ${expense.error}`);
-    }
-    if (!expense.amount || !Number.isFinite(expense.amount) || expense.amount <= 0) {
-      return new Response("⚠️ Could not identify transaction amount.");
-    }
-
-    const isRefund = expense.transaction_type === "refund" || expense.transaction_type === "hoan_tien";
-    const isCreditCard = expense.payment_method === "credit_card" || update.payment_method === "credit_card";
-    const paymentMethod = isCreditCard ? "credit_card" : "cash";
-    const isPaid = isCreditCard ? 0 : 1;
-
-    const finalAmount = isRefund ? -Math.abs(expense.amount) : Math.abs(expense.amount);
-    let actionText = isRefund ? "🟢 Refund / Cancellation" : "🔴 Expense";
-    if (isCreditCard && !isRefund) {
-      actionText = "💳 Credit Card Expense (Unpaid Debt)";
+      console.error("Gemini parse error:", expense.error);
+      const status = expense.error === "cannot_parse" ? 422 : expense.error.startsWith("AI service") ? 503 : 500;
+      return reply(`⚠️ ${stripHtml(friendlyParseError(expense.error))}`, status);
     }
 
-    const category = (expense.category || "").trim() || DEFAULT_CATEGORY;
-    const description = (expense.description || "").trim() || DEFAULT_DESCRIPTION;
-    const userId = (update.user_id || "").trim() || DEFAULT_USER_ID;
+    const transactions = buildTransactions(expense, update.payment_method === "credit_card");
+    if (transactions.length === 0) {
+      return reply(`⚠️ ${stripHtml(MSG.noAmount)}`, 422);
+    }
 
-    await insertExpense(env.DB, userId, finalAmount, category, description, paymentMethod, isPaid);
+    const userId =
+      (update.user_id || "").trim() ||
+      (env.SHORTCUT_USER_ID || "").trim() ||
+      (env.ADMIN_CHAT_ID || "").trim() ||
+      DEFAULT_USER_ID;
 
-    const formatted = formatCurrency(finalAmount);
-    const extraNote = isCreditCard && !isRefund ? "\n📌 Use /debt to view unpaid bills, or /pay to settle." : "";
-    return new Response(
-      `✅ Saved ${actionText}:\n💰 Amount: ${formatted}\n🏷 Category: ${category}\n📝 Description: ${description}${extraNote}`
-    );
+    const lines: string[] = [];
+    for (const tx of transactions) {
+      await saveTransaction(env.DB, userId, tx);
+      lines.push(savedText(tx, false));
+    }
+    return reply(lines.join("\n\n"));
   } catch (err: unknown) {
     console.error("Shortcut handler error:", err);
-    const msg = err instanceof Error ? err.message : "Internal error";
-    return new Response(`⚠️ Error: ${msg}`, { status: 500 });
+    return reply(`⚠️ ${stripHtml(MSG.genericError)}`, 500);
   }
 }
