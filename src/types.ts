@@ -8,6 +8,8 @@ export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   /** Google Gemini API key */
   GEMINI_API_KEY: string;
+  /** Telegram chat ID allowed to change the global Gemini model (/model). If unset, changes are disabled. */
+  ADMIN_CHAT_ID?: string;
 }
 
 /** Transaction classification: regular expense or refund/cancellation */

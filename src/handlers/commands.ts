@@ -1,7 +1,7 @@
 import { formatAmount, formatCurrency } from "../formatters";
 import {
   deleteExpenseById,
-  getConfig,
+  getConfigs,
   getLastExpense,
   getMonthExpensesByCategory,
   getTodayExpenses,
@@ -10,14 +10,14 @@ import {
   payCreditCardExpenses,
   setConfig,
 } from "../services/db";
-import { syncAvailableGeminiModels } from "../services/gemini";
+import { getDiscoveredModels, syncAvailableGeminiModels } from "../services/gemini";
 import { sendTelegram } from "../services/telegram";
 import { Env, ExpenseRow } from "../types";
 import {
   CONFIG_KEY_ACTIVE_MODEL,
-  CONFIG_KEY_DISCOVERED_MODELS,
   DEFAULT_GEMINI_MODEL,
-  FALLBACK_GEMINI_MODELS,
+  FALLBACK_GEMINI_MODEL,
+  GEMINI_MODEL_NAME_PATTERN,
 } from "../constants";
 
 /**
@@ -206,17 +206,10 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
         const arg = parts.slice(1).join(" ").trim();
 
         if (!arg) {
-          const activeModel = (await getConfig(env.DB, CONFIG_KEY_ACTIVE_MODEL)) || DEFAULT_GEMINI_MODEL;
-          const cachedRaw = await getConfig(env.DB, CONFIG_KEY_DISCOVERED_MODELS);
-          let models: string[] = [...FALLBACK_GEMINI_MODELS];
-          if (cachedRaw) {
-            try {
-              const parsed = JSON.parse(cachedRaw) as string[];
-              if (Array.isArray(parsed) && parsed.length > 0) {
-                models = parsed;
-              }
-            } catch {}
-          }
+          const cfg = await getConfigs(env.DB, [CONFIG_KEY_ACTIVE_MODEL]);
+          const activeModel = cfg[CONFIG_KEY_ACTIVE_MODEL] || DEFAULT_GEMINI_MODEL;
+          const discovered = await getDiscoveredModels(env.DB);
+          const models = discovered.length > 0 ? discovered : [DEFAULT_GEMINI_MODEL, FALLBACK_GEMINI_MODEL];
 
           let msg = "🤖 **Gemini AI Model Settings:**\n\n";
           msg += `• Active Model: **${activeModel}** ⭐\n\n`;
@@ -237,10 +230,27 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
           break;
         }
 
+        if (!env.ADMIN_CHAT_ID || env.ADMIN_CHAT_ID.trim() !== chatId.toString()) {
+          await sendTelegram(
+            env.TELEGRAM_BOT_TOKEN,
+            chatId,
+            "⛔ Only the bot admin can change the Gemini model (set ADMIN_CHAT_ID to your chat ID)."
+          );
+          break;
+        }
+
         const lowerArg = arg.toLowerCase();
 
         if (lowerArg === "sync" || lowerArg === "auto") {
-          const { activeModel, models } = await syncAvailableGeminiModels(env.GEMINI_API_KEY, env.DB);
+          let result;
+          try {
+            result = await syncAvailableGeminiModels(env.GEMINI_API_KEY, env.DB, lowerArg === "auto");
+          } catch (err: unknown) {
+            const reason = err instanceof Error ? err.message : String(err);
+            await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, `⚠️ Could not sync Gemini models: ${reason}`);
+            break;
+          }
+          const { activeModel, models } = result;
 
           let msg = lowerArg === "auto" ? "🔄 **Gemini AI Auto-Updated:**\n" : "🔄 **Gemini Models Synchronized:**\n";
           msg += `Active model set to: **${activeModel}** ⭐\n\n`;
@@ -265,7 +275,15 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
           break;
         }
 
-        const targetModel = arg.replace(/^models\//i, "").trim();
+        const targetModel = arg.replace(/^models\//i, "").trim().toLowerCase();
+        if (!GEMINI_MODEL_NAME_PATTERN.test(targetModel)) {
+          await sendTelegram(
+            env.TELEGRAM_BOT_TOKEN,
+            chatId,
+            `⚠️ Invalid model name: \`${targetModel.slice(0, 64)}\`. Use /model to see available models.`
+          );
+          break;
+        }
         await setConfig(env.DB, CONFIG_KEY_ACTIVE_MODEL, targetModel);
         await sendTelegram(
           env.TELEGRAM_BOT_TOKEN,

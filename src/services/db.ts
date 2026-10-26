@@ -187,42 +187,45 @@ export async function payAllCreditCardExpenses(
 }
 
 /**
- * Retrieves a configuration value by key from the app_config table.
+ * Retrieves several configuration values by key in a single query.
+ * Read failures are logged and treated as "not configured" so expense recording keeps working.
  */
-export async function getConfig(db: D1Database, key: string): Promise<string | null> {
+export async function getConfigs(db: D1Database, keys: string[]): Promise<Record<string, string>> {
+  if (keys.length === 0) return {};
   try {
-    const row = await db.prepare("SELECT value FROM app_config WHERE key = ?").bind(key).first<{ value: string }>();
-    return row?.value ?? null;
-  } catch {
-    try {
-      await db
-        .prepare(
-          "CREATE TABLE IF NOT EXISTS app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
-        )
-        .run();
-    } catch {}
-    return null;
+    const placeholders = keys.map(() => "?").join(", ");
+    const result = await db
+      .prepare(`SELECT key, value FROM app_config WHERE key IN (${placeholders})`)
+      .bind(...keys)
+      .all<{ key: string; value: string }>();
+    const out: Record<string, string> = {};
+    for (const row of result?.results ?? []) {
+      out[row.key] = row.value;
+    }
+    return out;
+  } catch (err: unknown) {
+    console.error("Failed to read config from D1:", err);
+    return {};
   }
 }
 
 /**
+ * Retrieves a configuration value by key from the app_config table.
+ */
+export async function getConfig(db: D1Database, key: string): Promise<string | null> {
+  return (await getConfigs(db, [key]))[key] ?? null;
+}
+
+/**
  * Sets or updates a configuration value by key in the app_config table.
+ * Throws on failure so callers never report a change that was not saved.
+ * The table is created by schema.sql.
  */
 export async function setConfig(db: D1Database, key: string, value: string): Promise<void> {
-  const upsertSql =
-    "INSERT INTO app_config (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP";
-  try {
-    await db.prepare(upsertSql).bind(key, value).run();
-  } catch {
-    try {
-      await db
-        .prepare(
-          "CREATE TABLE IF NOT EXISTS app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
-        )
-        .run();
-      await db.prepare(upsertSql).bind(key, value).run();
-    } catch (createErr: unknown) {
-      console.error("Failed to set config in D1:", createErr);
-    }
-  }
+  await db
+    .prepare(
+      "INSERT INTO app_config (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP"
+    )
+    .bind(key, value)
+    .run();
 }

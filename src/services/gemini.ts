@@ -4,12 +4,19 @@ import {
   CONFIG_KEY_DISCOVERED_MODELS,
   CONFIG_KEY_LAST_SYNCED,
   DEFAULT_GEMINI_MODEL,
-  FALLBACK_GEMINI_MODELS,
-  GEMINI_MODELS,
+  FALLBACK_GEMINI_MODEL,
   GEMINI_EXPENSE_SCHEMA,
+  GEMINI_MODEL_NAME_PATTERN,
+  MAX_GEMINI_ATTEMPTS,
   SYSTEM_PROMPT,
 } from "../constants";
-import { getConfig, setConfig } from "./db";
+import { getConfigs, setConfig } from "./db";
+
+/** Model name fragments that are not usable for text/vision JSON extraction. */
+const EXCLUDED_MODEL_PARTS = ["embedding", "aqa", "tts", "image", "live", "audio", "imagen", "veo", "robotics", "computer-use"];
+
+/** Plain base model such as `gemini-3.1-flash` (no preview/lite/dated suffix). */
+const BASE_FLASH_PATTERN = /^gemini-\d+(\.\d+)?-flash$/;
 
 /**
  * Queries Google Gemini v1beta/models API to discover all currently supported text/vision generation models.
@@ -20,7 +27,7 @@ export async function fetchAvailableGeminiModels(apiKey: string): Promise<string
     return [];
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey.trim()}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey.trim())}`;
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`Failed to fetch models from Google: HTTP ${res.status}`);
@@ -35,12 +42,15 @@ export async function fetchAvailableGeminiModels(apiKey: string): Promise<string
       const isGenerate = methods.includes("generateContent");
       const name = m.name.toLowerCase();
       const isGemini = name.includes("gemini");
-      const isNotEmbedding = !name.includes("embedding") && !name.includes("aqa");
-      return isGenerate && isGemini && isNotEmbedding;
+      const isUsable = !EXCLUDED_MODEL_PARTS.some((part) => name.includes(part));
+      return isGenerate && isGemini && isUsable;
     })
     .map((m) => m.name.replace(/^models\//, ""))
     .sort((a, b) => {
-      // Prioritize flash models, then version number descending
+      // Prioritize plain base flash models, then other flash models, then version number descending
+      const aIsBase = BASE_FLASH_PATTERN.test(a) ? 1 : 0;
+      const bIsBase = BASE_FLASH_PATTERN.test(b) ? 1 : 0;
+      if (aIsBase !== bIsBase) return bIsBase - aIsBase;
       const aIsFlash = a.includes("flash") ? 1 : 0;
       const bIsFlash = b.includes("flash") ? 1 : 0;
       if (aIsFlash !== bIsFlash) return bIsFlash - aIsFlash;
@@ -51,23 +61,46 @@ export async function fetchAvailableGeminiModels(apiKey: string): Promise<string
 }
 
 /**
+ * Returns the cached list of discovered models from D1 (empty if none/invalid).
+ */
+export async function getDiscoveredModels(db: D1Database): Promise<string[]> {
+  const cfg = await getConfigs(db, [CONFIG_KEY_DISCOVERED_MODELS]);
+  return parseDiscoveredModels(cfg[CONFIG_KEY_DISCOVERED_MODELS]);
+}
+
+function parseDiscoveredModels(raw: string | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((m): m is string => typeof m === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Synchronizes discovered models from Google Gemini API and stores them in D1 app_config.
- * Also ensures an active model is set.
+ * With `selectNewest`, the active model is switched to the best discovered model; otherwise it
+ * is only changed when the current one is unset or no longer available.
+ * Throws if Google returns no compatible models.
  */
 export async function syncAvailableGeminiModels(
   apiKey: string,
-  db: D1Database
+  db: D1Database,
+  selectNewest = false
 ): Promise<{ activeModel: string; models: string[] }> {
-  const discovered = await fetchAvailableGeminiModels(apiKey);
-  const models = discovered.length > 0 ? discovered : [...FALLBACK_GEMINI_MODELS];
+  const models = await fetchAvailableGeminiModels(apiKey);
+  if (models.length === 0) {
+    throw new Error("Google returned no compatible Gemini models (check GEMINI_API_KEY).");
+  }
 
   await setConfig(db, CONFIG_KEY_DISCOVERED_MODELS, JSON.stringify(models));
   await setConfig(db, CONFIG_KEY_LAST_SYNCED, new Date().toISOString());
 
-  let activeModel = await getConfig(db, CONFIG_KEY_ACTIVE_MODEL);
-  if (!activeModel || !models.includes(activeModel)) {
-    // Select the first recommended flash model or fallback default
-    activeModel = models[0] || DEFAULT_GEMINI_MODEL;
+  const cfg = await getConfigs(db, [CONFIG_KEY_ACTIVE_MODEL]);
+  let activeModel = cfg[CONFIG_KEY_ACTIVE_MODEL];
+  if (selectNewest || !activeModel || !models.includes(activeModel)) {
+    activeModel = models[0];
     await setConfig(db, CONFIG_KEY_ACTIVE_MODEL, activeModel);
   }
 
@@ -75,39 +108,23 @@ export async function syncAvailableGeminiModels(
 }
 
 /**
- * Builds the prioritized model sequence for request execution:
- * 1. Active configured model (from D1 or DEFAULT_GEMINI_MODEL)
- * 2. Cached discovered models
- * 3. Fallback hardcoded models
+ * Builds the model sequence for request execution (at most MAX_GEMINI_ATTEMPTS):
+ * active configured model (if any), DEFAULT_GEMINI_MODEL, FALLBACK_GEMINI_MODEL.
  */
-export async function resolveGeminiModelSequence(
-  apiKey: string,
-  db?: D1Database
-): Promise<string[]> {
+export async function resolveGeminiModelSequence(db?: D1Database): Promise<string[]> {
   const sequence: string[] = [];
 
   if (db) {
-    const active = await getConfig(db, CONFIG_KEY_ACTIVE_MODEL);
-    if (active) {
+    const cfg = await getConfigs(db, [CONFIG_KEY_ACTIVE_MODEL]);
+    const active = cfg[CONFIG_KEY_ACTIVE_MODEL];
+    if (active && GEMINI_MODEL_NAME_PATTERN.test(active)) {
       sequence.push(active);
-    }
-
-    const cachedRaw = await getConfig(db, CONFIG_KEY_DISCOVERED_MODELS);
-    if (cachedRaw) {
-      try {
-        const cached = JSON.parse(cachedRaw) as string[];
-        if (Array.isArray(cached)) {
-          sequence.push(...cached);
-        }
-      } catch {}
     }
   }
 
-  sequence.push(DEFAULT_GEMINI_MODEL);
-  sequence.push(...GEMINI_MODELS);
+  sequence.push(DEFAULT_GEMINI_MODEL, FALLBACK_GEMINI_MODEL);
 
-  // Return unique ordered models
-  return Array.from(new Set(sequence));
+  return Array.from(new Set(sequence)).slice(0, MAX_GEMINI_ATTEMPTS);
 }
 
 /**
@@ -126,12 +143,12 @@ export async function parseWithGemini(
     return { error: "Invalid payload provided" };
   }
 
-  const modelSequence = await resolveGeminiModelSequence(apiKey, db);
+  const modelSequence = await resolveGeminiModelSequence(db);
   let lastError = "";
 
   for (const model of modelSequence) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
 
       const res = await fetch(url, {
         method: "POST",
@@ -147,10 +164,13 @@ export async function parseWithGemini(
         }),
       });
 
-      if (!res) {
-        continue;
+      const data = (await res.json().catch(() => ({}))) as GeminiApiResponse;
+
+      if (res.status === 401 || res.status === 403) {
+        // Credentials problem: other models will fail the same way.
+        lastError = data.error?.message || `Access denied (HTTP ${res.status})`;
+        break;
       }
-      const data = (await res.json()) as GeminiApiResponse;
 
       if (res.status === 503 || res.status === 429) {
         lastError = data.error?.message || "Server busy";
@@ -163,7 +183,7 @@ export async function parseWithGemini(
       }
 
       if (!res.ok || data.error) {
-        lastError = data.error?.message || "Unknown error";
+        lastError = data.error?.message || `HTTP ${res.status}`;
         continue;
       }
 

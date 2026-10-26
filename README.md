@@ -6,7 +6,7 @@
 
 ## ✨ Features
 
-- **🧠 AI-Powered Transaction Parsing**: Uses Google Gemini (`gemini-3.8-flash` with automatic fallback to `gemini-3.5-flash`) to parse both free-form text and receipt photos into structured financial data.
+- **🧠 AI-Powered Transaction Parsing**: Uses Google Gemini (`gemini-3.1-flash` with automatic fallback to `gemini-2.5-flash`) to parse both free-form text and receipt photos into structured financial data.
 - **💳 Credit Card Debt Management**:
   - Automatically identifies credit card purchases from text or receipts.
   - Tracks unpaid credit card bills (`/debt`).
@@ -130,7 +130,12 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN
 
 # Google Gemini API Key
 npx wrangler secret put GEMINI_API_KEY
+
+# Your Telegram chat ID: only this chat can change the Gemini model via /model
+npx wrangler secret put ADMIN_CHAT_ID
 ```
+
+> `app_config` must exist in D1 (it is part of `schema.sql`); re-run the schema on existing databases.
 
 ### 5. Deploy to Cloudflare Workers
 

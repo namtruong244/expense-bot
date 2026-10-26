@@ -17,13 +17,19 @@ Strictly return data adhering to the JSON schema.
 `;
 
 /**
- * Model priority sequence for Gemini requests:
- * 1. gemini-3.8-flash: Primary high-speed vision/text model.
- * 2. gemini-3.5-flash: Automatic fallback model when primary is overloaded (503/429).
+ * Model priority sequence for Gemini requests (kept short: every entry is another network call on failure):
+ * 1. Active model configured via /model (D1), if any.
+ * 2. DEFAULT_GEMINI_MODEL: primary high-speed vision/text model.
+ * 3. FALLBACK_GEMINI_MODEL: stable model used when the others are overloaded or unavailable.
  */
-export const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
-export const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash"] as const;
-export const FALLBACK_GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-1.5-flash"] as const;
+export const DEFAULT_GEMINI_MODEL = "gemini-3.1-flash";
+export const FALLBACK_GEMINI_MODEL = "gemini-2.5-flash";
+
+/** Maximum number of models tried for a single request. */
+export const MAX_GEMINI_ATTEMPTS = 3;
+
+/** Valid Gemini model id (also guarantees it is safe to place in a URL path). */
+export const GEMINI_MODEL_NAME_PATTERN = /^gemini-[a-z0-9][a-z0-9._-]{0,63}$/;
 
 export const CONFIG_KEY_ACTIVE_MODEL = "gemini_active_model";
 export const CONFIG_KEY_DISCOVERED_MODELS = "gemini_discovered_models";

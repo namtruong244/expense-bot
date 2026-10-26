@@ -400,7 +400,7 @@ describe("Expense Bot Suite", () => {
       expect(result).toEqual({ error: "Missing GEMINI_API_KEY" });
     });
 
-    it("successfully parses valid response from gemini-3.8-flash", async () => {
+    it("successfully parses valid response from gemini-3.1-flash", async () => {
       const mockData = {
         amount: 45000,
         category: "Food & Dining",
@@ -428,7 +428,7 @@ describe("Expense Bot Suite", () => {
       expect(result).toEqual(mockData);
 
       const [calledUrl, calledInit] = fetchMock.mock.calls[0] as [string, RequestInit];
-      expect(calledUrl).toContain("models/gemini-3.8-flash:generateContent?key=key_gemini");
+      expect(calledUrl).toContain("models/gemini-3.1-flash:generateContent?key=key_gemini");
       expect(calledInit.method).toBe("POST");
 
       const body = JSON.parse(calledInit.body as string) as {
@@ -465,7 +465,7 @@ describe("Expense Bot Suite", () => {
       expect(result).toEqual(mockData);
     });
 
-    it("falls back to gemini-3.5-flash when gemini-3.8-flash returns 503 or 429", async () => {
+    it("falls back to gemini-2.5-flash when gemini-3.1-flash returns 503 or 429", async () => {
       const mockData = {
         amount: 30000,
         category: "Transportation",
@@ -502,8 +502,8 @@ describe("Expense Bot Suite", () => {
 
       const firstUrl = fetchMock.mock.calls[0]?.[0] as string;
       const secondUrl = fetchMock.mock.calls[1]?.[0] as string;
-      expect(firstUrl).toContain("models/gemini-3.8-flash");
-      expect(secondUrl).toContain("models/gemini-3.5-flash");
+      expect(firstUrl).toContain("models/gemini-3.1-flash");
+      expect(secondUrl).toContain("models/gemini-2.5-flash");
     });
 
     it("falls back to next model when first model returns payload with data.error", async () => {
@@ -689,7 +689,7 @@ describe("Expense Bot Suite", () => {
         new Response(
           JSON.stringify({
             models: [
-              { name: "models/gemini-3.8-flash", supportedGenerationMethods: ["generateContent"] },
+              { name: "models/gemini-3.1-flash", supportedGenerationMethods: ["generateContent"] },
               { name: "models/gemini-3.5-flash", supportedGenerationMethods: ["generateContent"] },
             ],
           })
@@ -700,14 +700,44 @@ describe("Expense Bot Suite", () => {
       const { db } = createMockD1();
       const { activeModel, models } = await syncAvailableGeminiModels("key_gemini", db);
 
-      expect(activeModel).toBe("gemini-3.8-flash");
-      expect(models).toContain("gemini-3.8-flash");
+      expect(activeModel).toBe("gemini-3.5-flash");
+      expect(models).toContain("gemini-3.1-flash");
+    });
+
+    it("fetchAvailableGeminiModels drops tts/image models and ranks base flash first", async () => {
+      globalThis.fetch = vi.fn().mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            models: ["gemini-2.5-flash-preview-tts", "gemini-2.5-flash-image", "gemini-2.5-flash-lite", "gemini-2.5-flash"].map(
+              (name) => ({ name: `models/${name}`, supportedGenerationMethods: ["generateContent"] })
+            ),
+          })
+        )
+      );
+      const models = await fetchAvailableGeminiModels("key_gemini");
+      expect(models).toEqual(["gemini-2.5-flash", "gemini-2.5-flash-lite"]);
+    });
+
+    it("syncAvailableGeminiModels throws when no models are discovered", async () => {
+      const { db } = createMockD1();
+      await expect(syncAvailableGeminiModels("", db)).rejects.toThrow();
+    });
+
+    it("resolveGeminiModelSequence is capped and ignores the discovered cache", async () => {
+      const { db } = createMockD1({
+        allResults: [
+          { key: "gemini_active_model", value: "gemini-2.0-flash" },
+          { key: "gemini_discovered_models", value: JSON.stringify(["a", "b", "c", "d", "e"]) },
+        ],
+      });
+      const seq = await resolveGeminiModelSequence(db);
+      expect(seq).toEqual(["gemini-2.0-flash", "gemini-3.1-flash", "gemini-2.5-flash"]);
     });
 
     it("resolveGeminiModelSequence resolves active model from db", async () => {
-      const { db } = createMockD1({ firstResult: { value: "gemini-2.5-flash" } });
+      const { db } = createMockD1({ allResults: [{ key: "gemini_active_model", value: "gemini-2.5-flash" }] });
 
-      const seq = await resolveGeminiModelSequence("key_gemini", db);
+      const seq = await resolveGeminiModelSequence(db);
       expect(seq[0]).toBe("gemini-2.5-flash");
     });
   });
@@ -1207,7 +1237,7 @@ describe("Expense Bot Suite", () => {
           new Response(
             JSON.stringify({
               models: [
-                { name: "models/gemini-3.8-flash", supportedGenerationMethods: ["generateContent"] },
+                { name: "models/gemini-3.1-flash", supportedGenerationMethods: ["generateContent"] },
                 { name: "models/gemini-3.5-flash", supportedGenerationMethods: ["generateContent"] },
               ],
             })
@@ -1222,6 +1252,7 @@ describe("Expense Bot Suite", () => {
         DB: db,
         TELEGRAM_BOT_TOKEN: "tok_123",
         GEMINI_API_KEY: "gem_123",
+        ADMIN_CHAT_ID: "7777",
       };
 
       await handleCommand("/model auto", 7777, env);
@@ -1242,6 +1273,7 @@ describe("Expense Bot Suite", () => {
         DB: db,
         TELEGRAM_BOT_TOKEN: "tok_123",
         GEMINI_API_KEY: "gem_123",
+        ADMIN_CHAT_ID: "7777",
       };
 
       await handleCommand("/model reset", 7777, env);
@@ -1249,7 +1281,7 @@ describe("Expense Bot Suite", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
       const body = JSON.parse(init.body as string) as { text: string };
-      expect(body.text).toContain("Reset Gemini model to default: **gemini-3.8-flash**");
+      expect(body.text).toContain("Reset Gemini model to default: **gemini-3.1-flash**");
     });
 
     it("/model <name>: switches active model to specified name", async () => {
@@ -1261,6 +1293,7 @@ describe("Expense Bot Suite", () => {
         DB: db,
         TELEGRAM_BOT_TOKEN: "tok_123",
         GEMINI_API_KEY: "gem_123",
+        ADMIN_CHAT_ID: "7777",
       };
 
       await handleCommand("/model gemini-3.5-flash", 7777, env);
@@ -1269,6 +1302,23 @@ describe("Expense Bot Suite", () => {
       const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
       const body = JSON.parse(init.body as string) as { text: string };
       expect(body.text).toContain("Active Gemini model changed to: **gemini-3.5-flash**");
+    });
+
+    it("/model <name>: rejects non-admin chats and invalid names", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
+      globalThis.fetch = fetchMock;
+
+      const { db, statements } = createMockD1();
+      const env: Env = { DB: db, TELEGRAM_BOT_TOKEN: "tok_123", GEMINI_API_KEY: "gem_123", ADMIN_CHAT_ID: "1" };
+
+      await handleCommand("/model gemini-2.5-pro", 7777, env);
+      let body = JSON.parse((fetchMock.mock.calls[0] as [string, RequestInit])[1].body as string) as { text: string };
+      expect(body.text).toContain("Only the bot admin");
+
+      await handleCommand("/model x#", 1, env);
+      body = JSON.parse((fetchMock.mock.calls[1] as [string, RequestInit])[1].body as string) as { text: string };
+      expect(body.text).toContain("Invalid model name");
+      expect(statements).toHaveLength(0);
     });
   });
 
