@@ -33,7 +33,7 @@ import { confirmedPayAllMaxId, payAllPrompt, payBills, sendPayAllConfirm } from 
  *   card:<id>           toggle cash <-> credit card (not for bills already paid)
  *   pay:<id>            pay one credit card bill
  *   payall              ask to confirm paying every bill (see /pay all)
- *   payallok:<maxId>:<count>:<total>  pay the bills the prompt showed
+ *   payallok:<maxId>:<hash>  pay the bills the prompt showed (hash = checksum of the shown bill IDs)
  *   cancel              dismiss a confirmation
  * Every query is scoped to the chat that pressed the button.
  */

@@ -72,7 +72,7 @@ export async function handleShortcut(
           ? 422
           : expense.error.startsWith("AI service")
             ? 503
-            : 500;
+            : 500; // includes "AI configuration error": the owner has to fix it
       return reply(`⚠️ ${stripHtml(friendlyParseError(expense.error))}`, status);
     }
 

@@ -37,6 +37,8 @@ import worker, {
   transactionKeyboard,
   payAllPrompt,
   FileTooLargeError,
+  callTelegram,
+  MAX_PAY_IDS,
 } from "../src/index";
 
 interface ExecutedStatement {
@@ -250,9 +252,55 @@ describe("Expense Bot Suite", () => {
     });
   });
 
+  describe("payCreditCardExpenses batching", () => {
+    const row = { id: 5, amount: 1000, description: "x" };
+
+    it("selects and updates in one batch, binding each distinct ID once", async () => {
+      const batchSpy = vi.fn();
+      const { db, statements } = createMockD1({ allResults: [row] });
+      const spied = { ...db, batch: (stmts: D1PreparedStatement[]) => (batchSpy(stmts.length), db.batch(stmts)) } as D1Database;
+
+      const paid = await payCreditCardExpenses(spied, "user_1", [5, 5, 7, 5, 7]);
+      expect(paid).toHaveLength(1);
+      expect(batchSpy.mock.calls).toEqual([[2]]);
+      expect(statements.map((st) => st.sql.trim().split(" ")[0])).toEqual(["SELECT", "UPDATE"]);
+      expect(statements[0].bindings).toEqual(["user_1", 5, 7]);
+      expect(statements[1].bindings).toEqual(["user_1", 5, 7]);
+    });
+
+    it("runs no query for more than MAX_PAY_IDS distinct IDs", async () => {
+      const { db, statements } = createMockD1({ allResults: [row] });
+      const ids = Array.from({ length: MAX_PAY_IDS + 1 }, (_, i) => i + 1);
+      expect(await payCreditCardExpenses(db, "user_1", ids)).toEqual([]);
+      expect(statements).toHaveLength(0);
+    });
+  });
+
   // ==========================================
   // 1. sendTelegram
   // ==========================================
+  describe("callTelegram() timeout", () => {
+    it("aborts a hanging request, returns null and sendTelegram does not retry", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchMock = vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+          })
+      );
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const started = Date.now();
+      expect(await callTelegram("tok", "sendChatAction", { chat_id: 1 }, 30)).toBeNull();
+      expect(Date.now() - started).toBeLessThan(1000);
+
+      // A failed call gives null, so sendTelegram does not retry as plain text.
+      fetchMock.mockRejectedValueOnce(new Error("network down"));
+      await sendTelegram("tok", 1, "hi");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe("sendTelegram()", () => {
     it("sends POST request to Telegram sendMessage API with HTML parse mode", async () => {
       const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
@@ -322,6 +370,22 @@ describe("Expense Bot Suite", () => {
         reply_markup: unknown;
       };
       expect(body.reply_markup).toEqual(kb);
+    });
+
+    it("does not throw when reading an error response body fails (e.g. aborted by the timeout)", async () => {
+      const broken = new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(new Error("aborted"));
+          },
+        }),
+        { status: 400 }
+      );
+      const fetchMock = vi.fn().mockResolvedValue(broken);
+      globalThis.fetch = fetchMock;
+
+      await expect(sendTelegram("bot_tok", 12345, "Hello")).resolves.toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it("catches network error gracefully without throwing exception", async () => {
@@ -619,7 +683,7 @@ describe("Expense Bot Suite", () => {
       expect(result.error).toMatch(/^AI service unavailable/);
     });
 
-    it("treats account problems (FAILED_PRECONDITION) as unavailable, not as bad input", async () => {
+    it("reports account problems (FAILED_PRECONDITION) as a configuration error, not as bad input", async () => {
       const fetchMock = vi.fn().mockResolvedValue(
         new Response(
           JSON.stringify({ error: { status: "FAILED_PRECONDITION", message: "User location is not supported for the API use." } }),
@@ -629,7 +693,7 @@ describe("Expense Bot Suite", () => {
       globalThis.fetch = fetchMock;
       const result = await parseWithGemini(dummyPayload, "key_gemini");
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(result.error).toMatch(/^AI service unavailable: User location/);
+      expect(result.error).toMatch(/^AI configuration error: User location/);
     });
 
     it("still reports a rejection when another model in the sequence is missing (404)", async () => {
@@ -651,7 +715,30 @@ describe("Expense Bot Suite", () => {
       globalThis.fetch = fetchMock;
       const result = await parseWithGemini(dummyPayload, "key_gemini");
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(result.error).toMatch(/^AI service unavailable: API key not valid/);
+      expect(result.error).toMatch(/^AI configuration error: API key not valid/);
+    });
+
+    it("reports 401/403 as a configuration error after one call", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { message: "Permission denied" } }), { status: 403 }));
+      globalThis.fetch = fetchMock;
+      expect(await parseWithGemini(dummyPayload, "key_gemini")).toEqual({ error: "AI configuration error: Permission denied" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("accepts one model's refusal of an image, but wants a second opinion on text", async () => {
+      const refused = () => new Response(JSON.stringify({ error: { status: "INVALID_ARGUMENT", message: "bad image" } }), { status: 400 });
+      const sequence = () =>
+        vi.fn().mockResolvedValueOnce(refused()).mockResolvedValueOnce(new Response("{}", { status: 404 })).mockResolvedValueOnce(new Response("{}", { status: 404 }));
+      const db = createMockD1({ allResults: [{ key: "gemini_active_model", value: "gemini-x" }] }).db;
+      const imagePayload: GeminiPayload = {
+        contents: [{ parts: [{ text: "receipt" }, { inline_data: { mime_type: "image/jpeg", data: "AAAA" } }] }],
+      };
+
+      globalThis.fetch = sequence();
+      expect((await parseWithGemini(imagePayload, "key_gemini", db)).error).toBe("AI request rejected: bad image");
+
+      globalThis.fetch = sequence();
+      expect((await parseWithGemini(dummyPayload, "key_gemini", db)).error).toMatch(/^AI service unavailable/);
     });
 
     it("gives up when the time budget runs out instead of hanging", async () => {
@@ -950,7 +1037,7 @@ describe("Expense Bot Suite", () => {
 
   // The checksum payallok buttons carry: ask the keyboard builder instead of duplicating the hash.
   const hashOf = (ids: number[]) =>
-    payAllPrompt(ids.map((id) => ({ id, amount: 0 }) as ExpenseRow)).keyboard.inline_keyboard[0][0].callback_data.split(":")[4];
+    payAllPrompt(ids.map((id) => ({ id, amount: 0 }) as ExpenseRow)).keyboard.inline_keyboard[0][0].callback_data.split(":")[2];
 
   const buttons = (m: SentMessage) => (m.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.callback_data);
 
@@ -1057,30 +1144,56 @@ describe("Expense Bot Suite", () => {
       expect(await claimTelegramUpdate(claimingDb, 100)).toBe(true);
       expect(await claimTelegramUpdate(claimingDb, 101)).toBe(false);
       expect(await claimTelegramUpdate(claimingDb, 5)).toBe(true);
-      // Without a prune: table, index, insert.
-      expect(statements.slice(0, 3).map((st) => st.sql.split(" ").slice(0, 3).join(" "))).toEqual([
-        "CREATE TABLE IF",
-        "CREATE INDEX IF",
-        "INSERT OR IGNORE",
-      ]);
-      expect(statements[1].sql).toContain("idx_telegram_updates_received ON telegram_updates (received_at)");
+      // Each claim is a prune followed by the insert, and nothing else.
+      expect(statements.slice(0, 2).map((st) => st.sql.split(" ").slice(0, 2).join(" "))).toEqual(["DELETE FROM", "INSERT OR"]);
+      expect(statements).toHaveLength(8);
     });
 
-    it("claimTelegramUpdate prunes old IDs only on every 100th update, in the same single batch", async () => {
+    it("claimTelegramUpdate prunes on every claim in the same single two-statement batch, without DDL", async () => {
       const batchSpy = vi.fn();
       const { db, statements } = createMockD1({ runMeta: { changes: 1 } });
       const spied = { ...db, batch: (stmts: D1PreparedStatement[]) => (batchSpy(stmts.length), db.batch(stmts)) } as D1Database;
-      const kinds = () => statements.splice(0).map((st) => st.sql.split(" ").slice(0, 2).join(" "));
 
-      expect(await claimTelegramUpdate(spied, 200)).toBe(true);
-      expect(kinds()).toEqual(["CREATE TABLE", "CREATE INDEX", "DELETE FROM", "INSERT OR"]);
       expect(await claimTelegramUpdate(spied, 201)).toBe(true);
-      expect(kinds()).toEqual(["CREATE TABLE", "CREATE INDEX", "INSERT OR"]);
-      expect(batchSpy.mock.calls).toEqual([[4], [3]]);
+      expect(statements.map((st) => st.sql.split(" ").slice(0, 2).join(" "))).toEqual(["DELETE FROM", "INSERT OR"]);
+      expect(statements[0].sql).toContain("received_at < datetime('now', '-6 days')");
+      expect(statements[1].bindings).toEqual([201]);
+      expect(batchSpy.mock.calls).toEqual([[2]]);
 
-      // The claim is read from the INSERT, wherever it sits in the batch.
+      // The claim is read from the INSERT.
       const dup = createMockD1({ runMeta: { changes: 0 } });
       expect(await claimTelegramUpdate(dup.db, 300)).toBe(false);
+    });
+
+    it("claimTelegramUpdate creates the table and index on 'no such table', then claims", async () => {
+      const { db, statements } = createMockD1({
+        runMeta: { changes: 1 },
+        onExecute: (st) => {
+          const created = statements.some((x) => x.sql.startsWith("CREATE TABLE"));
+          if (!created && st.sql.startsWith("DELETE FROM telegram_updates")) {
+            throw new Error("D1_ERROR: no such table: telegram_updates: SQLITE_ERROR");
+          }
+        },
+      });
+      expect(await claimTelegramUpdate(db, 7)).toBe(true);
+      expect(statements.map((st) => st.sql.split(" ").slice(0, 3).join(" "))).toEqual([
+        "DELETE FROM telegram_updates",
+        "CREATE TABLE IF",
+        "CREATE INDEX IF",
+        "DELETE FROM telegram_updates",
+        "INSERT OR IGNORE",
+      ]);
+      expect(statements[2].sql).toContain("idx_telegram_updates_received ON telegram_updates (received_at)");
+    });
+
+    it("claimTelegramUpdate lets other errors propagate", async () => {
+      const { db, statements } = createMockD1({
+        onExecute: () => {
+          throw new Error("D1 down");
+        },
+      });
+      await expect(claimTelegramUpdate(db, 7)).rejects.toThrow("D1 down");
+      expect(statements.some((st) => st.sql.startsWith("CREATE"))).toBe(false);
     });
 
     it("insertExpenses stores every row in one batch and returns their ids", async () => {
@@ -1271,10 +1384,34 @@ describe("Expense Bot Suite", () => {
       expect(buttons(messages[0])).toEqual(["pay:5", "pay:8", "payall"]);
     });
 
+    it("/debt lists a capped number of bills but totals all of them", async () => {
+      const many = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, amount: 100000, description: "Một khoản thẻ tín dụng khá dài dòng" }));
+      const { messages } = await runCommand("/debt", createMockD1({ allResults: many }).db);
+      expect(messages[0].text.length).toBeLessThan(4096);
+      expect(messages[0].text).toContain("Tổng nợ: 10.000.000 ₫");
+      expect(messages[0].text).toContain("#25</b>");
+      expect(messages[0].text).not.toContain("#26</b>");
+      expect(messages[0].text).toContain("… và 75 khoản khác");
+      expect(buttons(messages[0]).at(-1)).toBe("payall");
+    });
+
     it("/debt omits 'pay all' for a single bill and reports when there is no debt", async () => {
       const one = await runCommand("/nothe", createMockD1({ allResults: [{ id: 5, amount: 1000, description: "x" }] }).db);
       expect(buttons(one.messages[0])).toEqual(["pay:5"]);
       expect((await runCommand("/debt", createMockD1().db)).messages[0].text).toContain("Không có khoản thẻ");
+    });
+
+    it("/pay refuses more than MAX_PAY_IDS bills without running a query, and binds duplicates once", async () => {
+      const ids = Array.from({ length: MAX_PAY_IDS + 1 }, (_, i) => i + 1).join(",");
+      const tooMany = createMockD1({ allResults: [{ id: 1, amount: 1000, description: "x" }] });
+      const { messages } = await runCommand(`/pay ${ids}`, tooMany.db);
+      expect(messages[0].text).toContain(`tối đa ${MAX_PAY_IDS} khoản`);
+      expect(tooMany.statements).toHaveLength(0);
+
+      // Duplicates collapse first, so 120 repeats of two IDs are fine.
+      const dup = createMockD1({ allResults: [{ id: 1, amount: 1000, description: "x" }] });
+      await runCommand(`/pay ${Array.from({ length: 60 }, () => "1,2").join(",")}`, dup.db);
+      expect(dup.statements[0].bindings).toEqual(["1111", 1, 2]);
     });
 
     it("/pay validates arguments", async () => {
@@ -1309,7 +1446,7 @@ describe("Expense Bot Suite", () => {
       const { messages } = await runCommand("/pay all", db);
       expect(messages[0].text).toContain("Trả hết");
       expect(messages[0].text).toContain("100.000 ₫");
-      expect(buttons(messages[0])).toEqual([`payallok:5:1:100000:${hashOf([5])}`, "cancel"]);
+      expect(buttons(messages[0])).toEqual([`payallok:5:${hashOf([5])}`, "cancel"]);
       expect(statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
 
       expect((await runCommand("/pay all", createMockD1().db)).messages[0].text).toContain("Không có khoản thẻ");
@@ -1509,9 +1646,9 @@ describe("Expense Bot Suite", () => {
       const ask = await press("payall", bills);
       expect(String(find(ask.calls, "sendMessage")?.text)).toContain("Trả hết");
       const askButtons = (find(ask.calls, "sendMessage")?.reply_markup as SentMessage["reply_markup"])?.inline_keyboard.flat();
-      expect(askButtons?.[0].callback_data).toBe(`payallok:5:1:100000:${hashOf([5])}`);
+      expect(askButtons?.[0].callback_data).toBe(`payallok:5:${hashOf([5])}`);
 
-      const ok = await press(`payallok:5:1:100000:${hashOf([5])}`, bills);
+      const ok = await press(`payallok:5:${hashOf([5])}`, bills);
       expect(String(find(ok.calls, "editMessageText")?.text)).toContain("Đã ghi nhận thanh toán");
       const upd = ok.statements.find((st) => st.sql.includes("UPDATE expenses"));
       expect(upd?.sql).toContain("id <= ?");
@@ -1526,58 +1663,64 @@ describe("Expense Bot Suite", () => {
       const later = { id: 9, amount: 5000000, description: "Laptop" };
 
       // A bill recorded after the prompt (higher id) is left unpaid: only ids up to 5 are settled.
-      const newer = await press(`payallok:5:1:100000:${hashOf([5])}`, { allResults: [shown, later] });
+      const newer = await press(`payallok:5:${hashOf([5])}`, { allResults: [shown, later] });
       const upd = newer.statements.find((st) => st.sql.includes("UPDATE expenses"));
       expect(upd?.sql).toContain("id <= ?");
       expect(upd?.bindings).toEqual(["1111", 5]);
 
-      // An older bill that became unpaid after the prompt changes count/total: nothing is paid.
-      const changed = await press(`payallok:5:1:100000:${hashOf([5])}`, { allResults: [{ ...shown, id: 3 }, shown] });
+      // An older bill that became unpaid after the prompt changes the ID set: nothing is paid.
+      const changed = await press(`payallok:5:${hashOf([5])}`, { allResults: [{ ...shown, id: 3 }, shown] });
       expect(changed.statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
       const edit = find(changed.calls, "editMessageText");
       expect(String(edit?.text)).toContain("đã thay đổi");
       expect(String(edit?.text)).toContain("Trả hết <b>2</b> khoản");
       const kb = (edit?.reply_markup as SentMessage["reply_markup"])?.inline_keyboard.flat();
-      expect(kb?.[0].callback_data).toBe(`payallok:5:2:200000:${hashOf([3, 5])}`);
+      expect(kb?.[0].callback_data).toBe(`payallok:5:${hashOf([3, 5])}`);
 
       // Buttons sent before this change carry no snapshot and are asked again too.
       const legacy = await press("payallok", { allResults: [shown] });
       expect(legacy.statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
 
-      // So do old four-field buttons, which carry no checksum.
-      const old = await press("payallok:5:1:100000", { allResults: [shown] });
-      expect(old.statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
-      expect(String(find(old.calls, "editMessageText")?.text)).toContain("đã thay đổi");
+      // So do old four- and five-field buttons (maxId:count:total[:hash]), even with a valid hash.
+      for (const data of ["payallok:5:1:100000", `payallok:5:1:100000:${hashOf([5])}`, `payallok:5:${hashOf([5])}:extra`]) {
+        const old = await press(data, { allResults: [shown] });
+        expect(old.statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
+        expect(String(find(old.calls, "editMessageText")?.text)).toContain("đã thay đổi");
+      }
 
-      const none = await press(`payallok:5:1:100000:${hashOf([5])}`, { allResults: [] });
+      const none = await press(`payallok:5:${hashOf([5])}`, { allResults: [] });
       expect(String(find(none.calls, "editMessageText")?.text)).toContain("Không có khoản thẻ");
     });
 
-    it("payallok re-asks when different bills have the same maxId, count and total", async () => {
+    it("payallok re-asks when different bills have the same maxId, count and total (only the ID set differs)", async () => {
       // The prompt showed #5 (100k) and #9 (200k); now #7 (100k) and #9 (200k) are unpaid.
       const now = [
         { id: 7, amount: 100000, description: "A" },
         { id: 9, amount: 200000, description: "B" },
       ];
-      const { calls, statements } = await press(`payallok:9:2:300000:${hashOf([5, 9])}`, { allResults: now });
+      const { calls, statements } = await press(`payallok:9:${hashOf([5, 9])}`, { allResults: now });
       expect(statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
       expect(String(find(calls, "editMessageText")?.text)).toContain("đã thay đổi");
 
-      const same = await press(`payallok:9:2:300000:${hashOf([7, 9])}`, { allResults: now });
+      const same = await press(`payallok:9:${hashOf([7, 9])}`, { allResults: now });
       expect(same.statements.some((st) => st.sql.includes("UPDATE"))).toBe(true);
+    });
+
+    it("pins the payallok checksum so a change to the hash is noticed", () => {
+      expect(hashOf([5])).toBe("9fe16cb4");
     });
 
     it("keeps payallok callback_data within Telegram's 64 bytes for big values", () => {
       const bills = Array.from({ length: 999 }, (_, i) => ({ id: 900_000_000 + i, amount: -1_000_000_000_000 }));
       const { keyboard } = payAllPrompt(bills as unknown as ExpenseRow[]);
       const data = keyboard.inline_keyboard[0][0].callback_data;
-      expect(data).toMatch(/^payallok:900000998:999:-\d+:[0-9a-f]{8}$/);
+      expect(data).toMatch(/^payallok:900000998:[0-9a-f]{8}$/);
       expect(new TextEncoder().encode(data).length).toBeLessThanOrEqual(64);
     });
 
     it("payallok binds a fixed number of parameters however many bills are unpaid", async () => {
       const many = Array.from({ length: 150 }, (_, i) => ({ id: i + 1, amount: 1000, description: `b${i}` }));
-      const { statements } = await press(`payallok:150:150:150000:${hashOf(many.map((r) => r.id))}`, { allResults: many });
+      const { statements } = await press(`payallok:150:${hashOf(many.map((r) => r.id))}`, { allResults: many });
       // D1 allows at most 100 bound parameters per query.
       expect(Math.max(...statements.map((st) => st.bindings.length))).toBeLessThanOrEqual(2);
       expect(statements.some((st) => st.sql.includes("UPDATE expenses") && st.sql.includes("id <= ?"))).toBe(true);
@@ -1664,6 +1807,11 @@ describe("Expense Bot Suite", () => {
         const busy = await post(shortcut(), baseEnv(createMockD1().db));
         expect(busy.status).toBe(503);
         expect(await busy.text()).toContain("quá tải");
+
+        mockNetwork({ geminiStatus: 403 });
+        const misconfigured = await post(shortcut(), baseEnv(createMockD1().db));
+        expect(misconfigured.status).toBe(500);
+        expect(await misconfigured.text()).toContain("chưa được cấu hình");
       });
 
       it("returns 422 when no amount is found", async () => {

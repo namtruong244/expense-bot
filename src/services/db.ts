@@ -1,3 +1,4 @@
+import { MAX_PAY_IDS } from "../constants";
 import { CategorySummaryRow, ExpenseRow } from "../types";
 
 /** A transaction to insert with {@link insertExpenses}. */
@@ -228,23 +229,32 @@ export async function updateExpensePayment(
  * claimed, i.e. Telegram retried a webhook that is being or has been processed.
  * Each ID is stored on its own, so updates delivered out of order (parallel connections) or with
  * a lower ID (Telegram restarts the sequence after a quiet week) are still processed.
- * IDs older than six days are pruned now and then (every 100th update ID), well before Telegram could restart
- * the sequence after a quiet week. The table and its index are created on demand so databases that predate
- * them keep de-duplicating without a manual migration. Everything is one batch, i.e. one round trip.
+ * Every claim also prunes IDs older than six days (cheap thanks to the received_at index), well before Telegram
+ * could restart the sequence after a quiet week. The claim is one batch (prune + insert), i.e. one round trip.
+ * Databases that predate the table keep de-duplicating without a manual migration: on "no such table" it is
+ * created (with its index) and the claim retried once. Other errors propagate.
  */
 export async function claimTelegramUpdate(db: D1Database, updateId: number): Promise<boolean> {
-  const statements = [
-    db.prepare(
-      "CREATE TABLE IF NOT EXISTS telegram_updates (update_id INTEGER PRIMARY KEY, received_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
-    ),
-    db.prepare("CREATE INDEX IF NOT EXISTS idx_telegram_updates_received ON telegram_updates (received_at)"),
-  ];
-  if (updateId % 100 === 0) {
-    statements.push(db.prepare("DELETE FROM telegram_updates WHERE received_at < datetime('now', '-6 days')"));
+  const claim = async (): Promise<boolean> => {
+    const results = await db.batch([
+      db.prepare("DELETE FROM telegram_updates WHERE received_at < datetime('now', '-6 days')"),
+      db.prepare("INSERT OR IGNORE INTO telegram_updates (update_id) VALUES (?)").bind(updateId),
+    ]);
+    return (results[1]?.meta?.changes ?? 1) > 0;
+  };
+
+  try {
+    return await claim();
+  } catch (err: unknown) {
+    if (!/no such table/i.test(err instanceof Error ? err.message : String(err))) throw err;
+    await db.batch([
+      db.prepare(
+        "CREATE TABLE IF NOT EXISTS telegram_updates (update_id INTEGER PRIMARY KEY, received_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+      ),
+      db.prepare("CREATE INDEX IF NOT EXISTS idx_telegram_updates_received ON telegram_updates (received_at)"),
+    ]);
+    return claim();
   }
-  statements.push(db.prepare("INSERT OR IGNORE INTO telegram_updates (update_id) VALUES (?)").bind(updateId));
-  const results = await db.batch(statements);
-  return (results[statements.length - 1]?.meta?.changes ?? 1) > 0;
 }
 
 /**
@@ -300,7 +310,9 @@ export async function getUnpaidCreditCardExpenses(
 
 /**
  * Marks specified credit card transactions as paid (debt settlement).
- * Returns the list of rows that were successfully settled.
+ * Duplicate IDs count once; more than MAX_PAY_IDS distinct IDs settle nothing (callers check first, as D1 limits
+ * bound parameters). Selects and updates in one transaction so the returned rows are exactly the ones this call
+ * settled, even when the same bill is paid twice at once.
  */
 export async function payCreditCardExpenses(
   db: D1Database,
@@ -308,33 +320,23 @@ export async function payCreditCardExpenses(
   ids: number[]
 ): Promise<ExpenseRow[]> {
   const safeUserId = (userId || "").trim();
-  const validIds = ids.filter((id) => typeof id === "number" && Number.isInteger(id) && id > 0);
-  if (validIds.length === 0) {
+  const validIds = [...new Set(ids.filter((id) => typeof id === "number" && Number.isInteger(id) && id > 0))];
+  if (validIds.length === 0 || validIds.length > MAX_PAY_IDS) {
     return [];
   }
 
   const placeholders = validIds.map(() => "?").join(", ");
-  const selectQuery = `
-    SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
-    FROM expenses
-    WHERE user_id = ? AND payment_method = 'credit_card' AND is_paid = 0 AND id IN (${placeholders})
-    ORDER BY id ASC
-  `;
-  const result = await db.prepare(selectQuery).bind(safeUserId, ...validIds).all<ExpenseRow>();
-  const toPayRows = Array.isArray(result?.results) ? result.results : [];
-
-  if (toPayRows.length > 0) {
-    const updateIds = toPayRows.map((r) => r.id);
-    const updatePlaceholders = updateIds.map(() => "?").join(", ");
-    const updateQuery = `
-      UPDATE expenses
-      SET is_paid = 1, paid_at = CURRENT_TIMESTAMP
-      WHERE user_id = ? AND id IN (${updatePlaceholders})
-    `;
-    await db.prepare(updateQuery).bind(safeUserId, ...updateIds).run();
-  }
-
-  return toPayRows;
+  const where = `user_id = ? AND payment_method = 'credit_card' AND is_paid = 0 AND id IN (${placeholders})`;
+  const [selected] = await db.batch<ExpenseRow>([
+    db
+      .prepare(
+        `SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
+         FROM expenses WHERE ${where} ORDER BY id ASC`
+      )
+      .bind(safeUserId, ...validIds),
+    db.prepare(`UPDATE expenses SET is_paid = 1, paid_at = CURRENT_TIMESTAMP WHERE ${where}`).bind(safeUserId, ...validIds),
+  ]);
+  return Array.isArray(selected?.results) ? selected.results : [];
 }
 
 /**

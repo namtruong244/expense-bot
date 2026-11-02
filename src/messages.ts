@@ -1,4 +1,4 @@
-import { CATEGORIES, CATEGORY_LABELS } from "./constants";
+import { CATEGORIES, CATEGORY_LABELS, MAX_PAY_IDS } from "./constants";
 import { escapeHtml, formatAmount, formatDate, localToday, toLocalDate } from "./formatters";
 import { ExpenseRow, InlineKeyboard } from "./types";
 
@@ -45,6 +45,9 @@ export const MSG = {
     "🤔 Mình chưa hiểu đây là khoản chi nào. Hãy thử gõ như: <code>Ăn trưa 50k</code>, hoặc gửi ảnh hoá đơn.",
   noAmount: "🤔 Mình chưa xác định được số tiền. Hãy thử gõ lại kèm số tiền, ví dụ: <code>Cafe 40k</code>.",
   aiUnavailable: "⏳ Dịch vụ AI đang quá tải hoặc chưa sẵn sàng. Bạn thử lại sau ít phút nhé.",
+  aiConfigError:
+    "⚠️ Bot chưa được cấu hình đúng để dùng Gemini (API key, thanh toán hoặc khu vực). Hãy báo quản trị viên nhé.",
+  payTooMany: `⚠️ Mỗi lần chỉ trả được tối đa ${MAX_PAY_IDS} khoản. Hãy chia nhỏ danh sách, hoặc dùng <code>/pay all</code>.`,
   genericError: "⚠️ Có lỗi xảy ra, bạn thử lại sau nhé.",
   photoFailed: "⚠️ Mình không tải được ảnh hoá đơn. Bạn thử gửi lại nhé.",
   imageUnsupported: "🖼 Mình chỉ đọc được ảnh JPG, PNG, WEBP hoặc HEIC. Bạn gửi lại ảnh ở một trong các định dạng này nhé.",
@@ -63,6 +66,7 @@ export const MSG = {
 export function friendlyParseError(error: string): string {
   if (error === "cannot_parse") return MSG.cannotParse;
   if (error.startsWith("AI service unavailable")) return MSG.aiUnavailable;
+  if (error.startsWith("AI configuration error")) return MSG.aiConfigError;
   if (error.startsWith("AI request rejected")) return MSG.aiRejected;
   return MSG.genericError;
 }

@@ -47,6 +47,9 @@ export const CATEGORY_LABELS: Record<string, string> = {
 /** Local timezone offset (UTC+7) used for calendar-day reporting. */
 export const TZ_OFFSET_HOURS = 7;
 
+/** Most bill IDs one /pay command may settle (D1 allows 100 bound parameters per query). */
+export const MAX_PAY_IDS = 50;
+
 /** Maximum number of transactions recorded from a single message. */
 export const MAX_TRANSACTIONS_PER_MESSAGE = 10;
 
@@ -69,6 +72,8 @@ export const MAX_GEMINI_ATTEMPTS = 3;
 export const TELEGRAM_PROCESSING_BUDGET_MS = 24_000;
 export const TELEGRAM_DOWNLOAD_TIMEOUT_MS = 6_000;
 export const GEMINI_TIMEOUT_MS = 18_000;
+/** Longest a single Telegram Bot API call (sendMessage, sendChatAction…) may take before it is given up. */
+export const TELEGRAM_API_TIMEOUT_MS = 5_000;
 
 /** Image formats Gemini accepts as inline data. */
 export const SUPPORTED_IMAGE_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];

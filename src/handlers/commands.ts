@@ -3,6 +3,7 @@ import {
   DEFAULT_GEMINI_MODEL,
   FALLBACK_GEMINI_MODEL,
   GEMINI_MODEL_NAME_PATTERN,
+  MAX_PAY_IDS,
 } from "../constants";
 import { escapeHtml, formatAmount, formatCurrency, formatDate, localMonth, percentBar, toLocalDate } from "../formatters";
 import { BOT_COMMANDS, categoryLabel, describeRow, helpText, MSG } from "../messages";
@@ -27,6 +28,8 @@ import { CategorySummaryRow, Env, ExpenseRow, InlineKeyboard } from "../types";
 const MAX_DEBT_BUTTONS = 8;
 /** Paid bills listed in a payment confirmation; the rest are summarised so the message fits Telegram's 4096 characters. */
 const MAX_PAID_ROWS_LISTED = 20;
+/** Unpaid bills listed by /debt; the rest are summarised so the message fits Telegram's 4096 characters. */
+const MAX_DEBT_ROWS_LISTED = 25;
 
 function safeAmount(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -45,14 +48,15 @@ export function deleteConfirmKeyboard(id: number): InlineKeyboard {
 }
 
 /**
- * The unpaid bills a "pay all" prompt showed: every bill up to `maxId`, with their count and rounded total.
- * The confirm button carries it so a bill recorded after the prompt is never paid unseen.
+ * The unpaid bills a "pay all" prompt showed: every bill up to `maxId`, with their count and rounded total (for the
+ * prompt text). The confirm button carries only `maxId` and the ID checksum: amounts never change, so the ID set
+ * fully determines what was shown, and a bill recorded after the prompt is never paid unseen.
  */
 interface PayAllSnapshot {
   maxId: number;
   count: number;
   total: number;
-  /** Checksum of the bill IDs, so a different set with the same count and total does not match. */
+  /** Checksum of the bill IDs. */
   hash: string;
 }
 
@@ -83,7 +87,7 @@ export function payAllConfirmKeyboard(snapshot: PayAllSnapshot): InlineKeyboard 
       [
         {
           text: "✅ Xác nhận trả hết",
-          callback_data: `payallok:${snapshot.maxId}:${snapshot.count}:${snapshot.total}:${snapshot.hash}`,
+          callback_data: `payallok:${snapshot.maxId}:${snapshot.hash}`,
         },
         { text: "Huỷ", callback_data: "cancel" },
       ],
@@ -112,15 +116,16 @@ export async function sendPayAllConfirm(db: D1Database, token: string, chatId: n
 }
 
 /**
- * Checks a confirmed "pay all" prompt (`args` = its maxId, count, total and ID checksum) against the current unpaid
+ * Checks a confirmed "pay all" prompt (`args` = its maxId and ID checksum) against the current unpaid
  * bills. Returns the maxId to pay up to, or null when the bills no longer match what the user saw.
  */
 export function confirmedPayAllMaxId(unpaid: ExpenseRow[], args: string[]): number | null {
-  const [maxId, count, total] = args.slice(0, 3).map(Number);
-  if (![maxId, count, total].every(Number.isFinite)) return null;
+  // Buttons from older versions carry more fields (count, total) and are rejected, which re-prompts.
+  if (args.length !== 2) return null;
+  const maxId = Number(args[0]);
+  if (!Number.isFinite(maxId)) return null;
   const shown = unpaid.filter((r) => r.id <= maxId);
-  const current = payAllSnapshot(shown);
-  if (!shown.length || current.maxId !== maxId || current.count !== count || current.total !== total || current.hash !== args[3]) return null;
+  if (!shown.length || billIdsHash(shown) !== args[1]) return null;
   return maxId;
 }
 
@@ -327,10 +332,14 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
         let totalDebt = 0;
         let msg = "💳 <b>Các khoản thẻ tín dụng chưa trả</b>\n\n";
 
-        for (const bill of unpaid) {
+        for (const [index, bill] of unpaid.entries()) {
           totalDebt += safeAmount(bill.amount);
+          if (index >= MAX_DEBT_ROWS_LISTED) continue;
           const date = bill.created_at ? ` (${formatDate(toLocalDate(bill.created_at))})` : "";
           msg += `• <b>#${bill.id}</b> ${describeRow(bill)}${date}\n`;
+        }
+        if (unpaid.length > MAX_DEBT_ROWS_LISTED) {
+          msg += `… và ${unpaid.length - MAX_DEBT_ROWS_LISTED} khoản khác\n`;
         }
 
         msg += `\n━━━━━━━━━━━━━━━\n💳 <b>Tổng nợ: ${formatCurrency(totalDebt)}</b>\n\n`;
@@ -360,12 +369,20 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
           return;
         }
 
-        const ids = arg
-          .split(/[\s,]+/)
-          .map(Number)
-          .filter((n) => Number.isInteger(n) && n > 0);
+        const ids = [
+          ...new Set(
+            arg
+              .split(/[\s,]+/)
+              .map(Number)
+              .filter((n) => Number.isInteger(n) && n > 0)
+          ),
+        ];
         if (ids.length === 0) {
           await sendTelegram(token, chatId, MSG.payInvalid);
+          return;
+        }
+        if (ids.length > MAX_PAY_IDS) {
+          await sendTelegram(token, chatId, MSG.payTooMany);
           return;
         }
 

@@ -145,8 +145,10 @@ function normalizeAmount(data: ExpenseData): void {
  * Dynamically resolves model sequence and automatically falls back if primary models are busy or deprecated.
  * All attempts share one `timeoutMs` budget so the caller always gets an answer in time to reply.
  * Each attempt gets 60% of the time left (the last one gets all of it), so one hanging model cannot starve the fallbacks.
- * Errors start with "AI request rejected" when nothing failed for a transient reason and at least two models
- * answered, all of them refusing the input itself (HTTP 400 INVALID_ARGUMENT, e.g. an unreadable image).
+ * Errors start with "AI configuration error" for account problems (bad API key, billing, region): retrying never helps.
+ * They start with "AI request rejected" when nothing failed for a transient reason and every model that answered
+ * refused the input itself (HTTP 400 INVALID_ARGUMENT, e.g. an unreadable image), provided at least two answered
+ * or the payload has an image (one model's refusal of a picture is enough; text needs a second opinion).
  * Anything else, including missing models, is "AI service unavailable".
  */
 export async function parseWithGemini(
@@ -171,6 +173,7 @@ export async function parseWithGemini(
   let answered = 0;
   // Busy, timed out, network error…: retrying later might work, so the input is not to blame.
   let transientFailure = false;
+  const hasImage = payload.contents.some((c) => c.parts?.some((p) => "inline_data" in p));
 
   for (const [index, model] of modelSequence.entries()) {
     const remainingMs = deadline - Date.now();
@@ -208,9 +211,7 @@ export async function parseWithGemini(
         (data.error?.status === "FAILED_PRECONDITION" || /api key/i.test(data.error?.message || ""));
       if (res.status === 401 || res.status === 403 || isAccountProblem) {
         // Credentials, billing or region problem: other models will fail the same way.
-        lastError = data.error?.message || `Access denied (HTTP ${res.status})`;
-        transientFailure = true;
-        break;
+        return { error: `AI configuration error: ${data.error?.message || `Access denied (HTTP ${res.status})`}` };
       }
 
       if (res.status === 400) {
@@ -269,7 +270,7 @@ export async function parseWithGemini(
     }
   }
 
-  if (!transientFailure && answered >= 2 && rejections === answered) {
+  if (!transientFailure && (answered >= 2 || (hasImage && answered >= 1)) && rejections === answered) {
     return { error: `AI request rejected: ${rejectionError}` };
   }
   return { error: `AI service unavailable: ${lastError}` };

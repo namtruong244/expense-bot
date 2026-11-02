@@ -1,19 +1,25 @@
-import { TELEGRAM_DOWNLOAD_TIMEOUT_MS } from "../constants";
+import { TELEGRAM_API_TIMEOUT_MS, TELEGRAM_DOWNLOAD_TIMEOUT_MS } from "../constants";
 import { stripHtml } from "../formatters";
 import { InlineKeyboard, TelegramGetFileResponse } from "../types";
 
 const API_BASE = "https://api.telegram.org";
 
 /**
- * Calls a Telegram Bot API method with a JSON body. Never throws: network errors are logged.
- * Returns the HTTP response (or null on network failure) so callers can inspect failures.
+ * Calls a Telegram Bot API method with a JSON body. Never throws: network errors and timeouts
+ * (TELEGRAM_API_TIMEOUT_MS) are logged. Returns the HTTP response (or null on network failure or timeout) so callers can inspect failures.
  */
-async function callTelegram(token: string, method: string, body: Record<string, unknown>): Promise<Response | null> {
+export async function callTelegram(
+  token: string,
+  method: string,
+  body: Record<string, unknown>,
+  timeoutMs: number = TELEGRAM_API_TIMEOUT_MS
+): Promise<Response | null> {
   try {
     return await fetch(`${API_BASE}/bot${token}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err: unknown) {
     console.error(`Telegram ${method} failed:`, err);
@@ -24,8 +30,13 @@ async function callTelegram(token: string, method: string, body: Record<string, 
 /** True when Telegram rejected the request because the HTML could not be parsed. */
 async function isParseError(res: Response | null): Promise<boolean> {
   if (!res || res.ok || res.status !== 400) return false;
-  const errText = await res.text();
-  return errText.toLowerCase().includes("parse");
+  try {
+    // The body is still read under callTelegram's timeout, so this can abort too.
+    const errText = await res.text();
+    return errText.toLowerCase().includes("parse");
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -168,7 +179,7 @@ export async function downloadTelegramFileAsBase64(
   }
 
   const signal = AbortSignal.timeout(timeoutMs);
-  const metaRes = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`, {
+  const metaRes = await fetch(`${API_BASE}/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`, {
     signal,
   });
   if (!metaRes.ok) {
@@ -187,7 +198,7 @@ export async function downloadTelegramFileAsBase64(
     throw new FileTooLargeError(maxBytes);
   }
 
-  const fileRes = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`, { signal });
+  const fileRes = await fetch(`${API_BASE}/file/bot${token}/${filePath}`, { signal });
   if (!fileRes.ok) {
     throw new Error(`Failed to download file from Telegram CDN: HTTP ${fileRes.status}`);
   }

@@ -16,7 +16,7 @@
 - **📱 Apple Shortcuts Integration**: Direct webhook endpoint (`source: "shortcut"`) allowing 1-tap expense logging via iPhone Action Button, Siri, or Share Sheet with instant notifications.
 - **🖱 Inline buttons & feedback**: undo / change category / toggle credit card under each entry, "typing…" indicator while the AI works, friendly Vietnamese messages and HTML-safe formatting.
 - **🧾 Multi-transaction & back-dated entries**: one message can record several purchases and dates such as "hôm qua".
-- **🔁 Safe webhook**: checks Telegram's secret token, replies immediately (`ctx.waitUntil`, with time budgets so every message gets an answer) and ignores Telegram retries by `update_id`.
+- **🔁 Safe webhook**: checks Telegram's secret token, replies immediately (`ctx.waitUntil`, with time budgets that bound the work done after the reply) and ignores Telegram retries by `update_id`.
 - **⚡ Serverless & Global**: Runs on Cloudflare's global edge network with sub-second execution and Cloudflare D1 distributed SQLite storage.
 - **🛡️ 100% Type-Safe & Clean Architecture**: Strict TypeScript without `any` types, modular structure (services, handlers, formatters), and 110+ comprehensive unit tests with Vitest.
 
