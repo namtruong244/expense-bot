@@ -7,7 +7,6 @@ import {
 import { escapeHtml, formatAmount, formatCurrency, formatDate, localMonth, percentBar, toLocalDate } from "../formatters";
 import { BOT_COMMANDS, categoryLabel, describeRow, helpText, MSG } from "../messages";
 import {
-  deleteExpenseById,
   getConfigs,
   getExpenseById,
   getLastExpense,
@@ -17,8 +16,8 @@ import {
   getTodayExpenses,
   getUnpaidCreditCardExpenses,
   getWeekExpensesByCategory,
-  payAllCreditCardExpenses,
   payCreditCardExpenses,
+  payCreditCardExpensesUpTo,
   setConfig,
 } from "../services/db";
 import { getDiscoveredModels, syncAvailableGeminiModels } from "../services/gemini";
@@ -26,6 +25,8 @@ import { sendTelegram, setTelegramCommands } from "../services/telegram";
 import { CategorySummaryRow, Env, ExpenseRow, InlineKeyboard } from "../types";
 
 const MAX_DEBT_BUTTONS = 8;
+/** Paid bills listed in a payment confirmation; the rest are summarised so the message fits Telegram's 4096 characters. */
+const MAX_PAID_ROWS_LISTED = 20;
 
 function safeAmount(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -43,31 +44,107 @@ export function deleteConfirmKeyboard(id: number): InlineKeyboard {
   };
 }
 
-/** Builds the keyboard asking the user to confirm paying every unpaid credit card bill. */
-export function payAllConfirmKeyboard(): InlineKeyboard {
+/**
+ * The unpaid bills a "pay all" prompt showed: every bill up to `maxId`, with their count and rounded total.
+ * The confirm button carries it so a bill recorded after the prompt is never paid unseen.
+ */
+interface PayAllSnapshot {
+  maxId: number;
+  count: number;
+  total: number;
+  /** Checksum of the bill IDs, so a different set with the same count and total does not match. */
+  hash: string;
+}
+
+/** 32-bit FNV-1a of the sorted bill IDs, as 8 hex characters. */
+function billIdsHash(bills: ExpenseRow[]): string {
+  let hash = 0x811c9dc5;
+  for (const id of bills.map((r) => r.id).sort((a, b) => a - b)) {
+    for (const ch of `${id},`) {
+      hash = Math.imul(hash ^ ch.charCodeAt(0), 0x01000193) >>> 0;
+    }
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+function payAllSnapshot(bills: ExpenseRow[]): PayAllSnapshot {
+  return {
+    maxId: bills.reduce((max, r) => Math.max(max, r.id), 0),
+    count: bills.length,
+    total: Math.round(bills.reduce((sum, r) => sum + safeAmount(r.amount), 0)),
+    hash: billIdsHash(bills),
+  };
+}
+
+/** Builds the keyboard asking the user to confirm paying the bills in `snapshot`. */
+export function payAllConfirmKeyboard(snapshot: PayAllSnapshot): InlineKeyboard {
   return {
     inline_keyboard: [
       [
-        { text: "✅ Xác nhận trả hết", callback_data: "payallok" },
+        {
+          text: "✅ Xác nhận trả hết",
+          callback_data: `payallok:${snapshot.maxId}:${snapshot.count}:${snapshot.total}:${snapshot.hash}`,
+        },
         { text: "Huỷ", callback_data: "cancel" },
       ],
     ],
   };
 }
 
+/** The "pay all" confirmation prompt for the given unpaid bills (at least one). */
+export function payAllPrompt(unpaid: ExpenseRow[]): { text: string; keyboard: InlineKeyboard } {
+  const snapshot = payAllSnapshot(unpaid);
+  return {
+    text: `💳 Trả hết <b>${snapshot.count}</b> khoản, tổng <b>${formatCurrency(snapshot.total)}</b>?`,
+    keyboard: payAllConfirmKeyboard(snapshot),
+  };
+}
+
+/** Sends the "pay all" confirmation prompt, or says there is nothing to pay. Used by /pay all and its button. */
+export async function sendPayAllConfirm(db: D1Database, token: string, chatId: number, userId: string): Promise<void> {
+  const unpaid = await getUnpaidCreditCardExpenses(db, userId);
+  if (!unpaid.length) {
+    await sendTelegram(token, chatId, MSG.noDebtToPay);
+    return;
+  }
+  const { text, keyboard } = payAllPrompt(unpaid);
+  await sendTelegram(token, chatId, text, keyboard);
+}
+
+/**
+ * Checks a confirmed "pay all" prompt (`args` = its maxId, count, total and ID checksum) against the current unpaid
+ * bills. Returns the maxId to pay up to, or null when the bills no longer match what the user saw.
+ */
+export function confirmedPayAllMaxId(unpaid: ExpenseRow[], args: string[]): number | null {
+  const [maxId, count, total] = args.slice(0, 3).map(Number);
+  if (![maxId, count, total].every(Number.isFinite)) return null;
+  const shown = unpaid.filter((r) => r.id <= maxId);
+  const current = payAllSnapshot(shown);
+  if (!shown.length || current.maxId !== maxId || current.count !== count || current.total !== total || current.hash !== args[3]) return null;
+  return maxId;
+}
+
 /**
  * Settles credit card bills and returns the confirmation text, or null if none matched.
- * `target` is a list of bill IDs, or "all".
+ * `target` is a list of bill IDs, or every unpaid bill up to a confirmed maxId.
  */
-export async function payBills(db: D1Database, userId: string, target: number[] | "all"): Promise<string | null> {
-  const paidRows: ExpenseRow[] =
-    target === "all" ? await payAllCreditCardExpenses(db, userId) : await payCreditCardExpenses(db, userId, target);
+export async function payBills(
+  db: D1Database,
+  userId: string,
+  target: number[] | { upToId: number }
+): Promise<string | null> {
+  const paidRows = Array.isArray(target)
+    ? await payCreditCardExpenses(db, userId, target)
+    : await payCreditCardExpensesUpTo(db, userId, target.upToId);
   if (!paidRows.length) return null;
 
   const totalPaid = paidRows.reduce((sum, r) => sum + safeAmount(r.amount), 0);
   let msg = `✅ <b>Đã ghi nhận thanh toán thẻ tín dụng</b>\nĐã trả ${paidRows.length} khoản, tổng <b>${formatCurrency(totalPaid)}</b>:\n`;
-  for (const r of paidRows) {
-    msg += `• #${r.id}: ${formatAmount(r.amount)} - ${escapeHtml(r.description || "Transaction")}\n`;
+  for (const r of paidRows.slice(0, MAX_PAID_ROWS_LISTED)) {
+    msg += `• <b>#${r.id}</b> ${describeRow(r)}\n`;
+  }
+  if (paidRows.length > MAX_PAID_ROWS_LISTED) {
+    msg += `… và ${paidRows.length - MAX_PAID_ROWS_LISTED} khoản khác\n`;
   }
 
   const remaining = await getUnpaidCreditCardExpenses(db, userId);
@@ -145,10 +222,8 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
         let msg = "📅 <b>Giao dịch hôm nay</b>\n\n";
 
         for (const row of records) {
-          const amount = safeAmount(row.amount);
-          total += amount;
-          const icon = amount < 0 ? "🟢" : row.payment_method === "credit_card" ? "💳" : "🔴";
-          msg += `• ${icon} <b>${formatAmount(amount)}</b> - ${escapeHtml(categoryLabel(row.category || "Other"))}: ${escapeHtml(row.description || "Transaction")}\n`;
+          total += safeAmount(row.amount);
+          msg += `• ${describeRow(row)}\n`;
         }
 
         const totalPrefix = total < 0 ? "🟢 Tiết kiệm ròng:" : "🔴 Tổng chi:";
@@ -253,10 +328,9 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
         let msg = "💳 <b>Các khoản thẻ tín dụng chưa trả</b>\n\n";
 
         for (const bill of unpaid) {
-          const amount = safeAmount(bill.amount);
-          totalDebt += amount;
+          totalDebt += safeAmount(bill.amount);
           const date = bill.created_at ? ` (${formatDate(toLocalDate(bill.created_at))})` : "";
-          msg += `• <b>#${bill.id}</b> • ${formatAmount(amount)} - ${escapeHtml(categoryLabel(bill.category || "Other"))}: ${escapeHtml(bill.description || "Transaction")}${date}\n`;
+          msg += `• <b>#${bill.id}</b> ${describeRow(bill)}${date}\n`;
         }
 
         msg += `\n━━━━━━━━━━━━━━━\n💳 <b>Tổng nợ: ${formatCurrency(totalDebt)}</b>\n\n`;
@@ -282,18 +356,7 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
         }
 
         if (arg === "all") {
-          const unpaid = await getUnpaidCreditCardExpenses(env.DB, userId);
-          if (!unpaid.length) {
-            await sendTelegram(token, chatId, MSG.noDebtToPay);
-            return;
-          }
-          const total = unpaid.reduce((sum, r) => sum + safeAmount(r.amount), 0);
-          await sendTelegram(
-            token,
-            chatId,
-            `💳 Trả hết <b>${unpaid.length}</b> khoản, tổng <b>${formatCurrency(total)}</b>?`,
-            payAllConfirmKeyboard()
-          );
+          await sendPayAllConfirm(env.DB, token, chatId, userId);
           return;
         }
 

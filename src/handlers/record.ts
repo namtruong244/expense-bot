@@ -1,7 +1,7 @@
 import { DEFAULT_CATEGORY, DEFAULT_DESCRIPTION, MAX_TRANSACTIONS_PER_MESSAGE, TZ_OFFSET_HOURS } from "../constants";
 import { localToday } from "../formatters";
 import { SavedTransaction } from "../messages";
-import { insertExpense } from "../services/db";
+import { insertExpenses } from "../services/db";
 import { ExpenseData } from "../types";
 
 /** A transaction ready to be stored. */
@@ -58,16 +58,21 @@ export function buildTransactions(expense: ExpenseData, forceCreditCard = false)
   return result;
 }
 
-/** Stores a transaction and returns its row ID (0 if unknown). */
-export async function saveTransaction(db: D1Database, userId: string, tx: NewTransaction): Promise<number> {
-  return insertExpense(
+/**
+ * Stores all transactions of one message atomically and returns their row IDs (0 if unknown).
+ * Throws if the batch fails, in which case nothing was stored.
+ */
+export async function saveTransactions(db: D1Database, userId: string, txs: NewTransaction[]): Promise<number[]> {
+  return insertExpenses(
     db,
     userId,
-    tx.amount,
-    tx.category,
-    tx.description,
-    tx.paymentMethod,
-    tx.isPaid ? 1 : 0,
-    tx.date ? backdateToTimestamp(tx.date) : undefined
+    txs.map((tx) => ({
+      amount: tx.amount,
+      category: tx.category,
+      description: tx.description,
+      paymentMethod: tx.paymentMethod,
+      isPaid: tx.isPaid ? 1 : 0,
+      createdAt: tx.date ? backdateToTimestamp(tx.date) : undefined,
+    }))
   );
 }

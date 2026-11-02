@@ -25,10 +25,6 @@ export function formatAmount(amount: number): string {
 /** Same output as {@link formatAmount}; kept as a separate name for call sites that format totals. */
 export const formatCurrency = formatAmount;
 
-/** Aliases for backwards compatibility */
-export const formatVnd = formatAmount;
-export const formatCurrencyVnd = formatAmount;
-
 /** Escapes text for Telegram HTML parse mode. */
 export function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

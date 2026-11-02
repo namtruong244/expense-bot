@@ -26,13 +26,17 @@ import worker, {
   deleteExpenseById,
   getUnpaidCreditCardExpenses,
   payCreditCardExpenses,
-  payAllCreditCardExpenses,
   ExpenseRow,
   fetchAvailableGeminiModels,
   syncAvailableGeminiModels,
   resolveGeminiModelSequence,
   getConfig,
   setConfig,
+  insertExpenses,
+  secretMatches,
+  transactionKeyboard,
+  payAllPrompt,
+  FileTooLargeError,
 } from "../src/index";
 
 interface ExecutedStatement {
@@ -91,8 +95,9 @@ function createMockD1(config: MockD1Config = {}): {
           const executed = { sql, bindings: currentBindings };
           statements.push(executed);
           config.onExecute?.(executed);
+          // SELECTs inside a batch() are run(), so they return rows like all() does.
           return {
-            results: [] as T[],
+            results: (/^\s*SELECT/i.test(sql) ? (config.allResults ?? []) : []) as T[],
             success: true,
             meta: { ...mockMeta, ...config.runMeta },
           };
@@ -113,8 +118,11 @@ function createMockD1(config: MockD1Config = {}): {
     async dump(): Promise<ArrayBuffer> {
       return new ArrayBuffer(0);
     },
-    async batch<T = unknown>(_statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
-      return [];
+    // Runs the statements in order; a statement that throws rejects the whole batch, like D1.
+    async batch<T = unknown>(batched: D1PreparedStatement[]): Promise<D1Result<T>[]> {
+      const results: D1Result<T>[] = [];
+      for (const stmt of batched) results.push(await stmt.run<T>());
+      return results;
     },
     async exec(_query: string): Promise<D1ExecResult> {
       return { count: 0, duration: 0 };
@@ -239,21 +247,6 @@ describe("Expense Bot Suite", () => {
       const updateStmt = statements.find((s) => s.sql.includes("UPDATE expenses") && s.sql.includes("is_paid = 1"));
       expect(updateStmt).toBeDefined();
       expect(updateStmt?.bindings).toEqual(["user_1", 5]);
-    });
-
-    it("payAllCreditCardExpenses marks all unpaid bills as paid", async () => {
-      const mockRows: ExpenseRow[] = [
-        { id: 10, user_id: "user_1", amount: 50000, category: "Snacks", description: "Chips", payment_method: "credit_card", is_paid: 0 },
-      ];
-      const { db, statements } = createMockD1({ allResults: mockRows as unknown as Record<string, unknown>[] });
-
-      const paid = await payAllCreditCardExpenses(db, "user_1");
-      expect(paid).toHaveLength(1);
-      expect(paid[0].id).toBe(10);
-
-      const updateStmt = statements.find((s) => s.sql.includes("UPDATE expenses"));
-      expect(updateStmt).toBeDefined();
-      expect(updateStmt?.bindings).toEqual(["user_1"]);
     });
   });
 
@@ -602,6 +595,100 @@ describe("Expense Bot Suite", () => {
       expect(result).toEqual({ error: "AI service unavailable: Service unavailable" });
     });
 
+    it("reports 'AI request rejected' only when every model refused the input", async () => {
+      const bad = () => new Response(JSON.stringify({ error: { status: "INVALID_ARGUMENT", message: "Unsupported MIME type" } }), { status: 400 });
+      globalThis.fetch = vi.fn().mockImplementation(async () => bad());
+      expect(await parseWithGemini(dummyPayload, "key_gemini")).toEqual({
+        error: "AI request rejected: Unsupported MIME type",
+      });
+
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValueOnce(bad())
+        .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "busy" } }), { status: 503 }));
+      expect((await parseWithGemini(dummyPayload, "key_gemini")).error).toMatch(/^AI service unavailable/);
+    });
+
+    it("blames the configuration, not the input, when the other models are missing (404)", async () => {
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ error: { status: "INVALID_ARGUMENT", message: "bad image" } }), { status: 400 }))
+        .mockResolvedValueOnce(new Response("{}", { status: 404 }))
+        .mockResolvedValueOnce(new Response("{}", { status: 404 }));
+      const result = await parseWithGemini(dummyPayload, "key_gemini", createMockD1({ allResults: [{ key: "gemini_active_model", value: "gemini-x" }] }).db);
+      expect(result.error).toMatch(/^AI service unavailable/);
+    });
+
+    it("treats account problems (FAILED_PRECONDITION) as unavailable, not as bad input", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: { status: "FAILED_PRECONDITION", message: "User location is not supported for the API use." } }),
+          { status: 400 }
+        )
+      );
+      globalThis.fetch = fetchMock;
+      const result = await parseWithGemini(dummyPayload, "key_gemini");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.error).toMatch(/^AI service unavailable: User location/);
+    });
+
+    it("still reports a rejection when another model in the sequence is missing (404)", async () => {
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ error: { status: "INVALID_ARGUMENT", message: "bad image" } }), { status: 400 }))
+        .mockResolvedValueOnce(new Response("{}", { status: 404 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ error: { status: "INVALID_ARGUMENT", message: "bad image" } }), { status: 400 }));
+      const result = await parseWithGemini(dummyPayload, "key_gemini", createMockD1({ allResults: [{ key: "gemini_active_model", value: "gemini-x" }] }).db);
+      expect(result.error).toBe("AI request rejected: bad image");
+    });
+
+    it("stops after one call when Gemini says the API key is invalid", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: { message: "API key not valid. Please pass a valid API key." } }), {
+          status: 400,
+        })
+      );
+      globalThis.fetch = fetchMock;
+      const result = await parseWithGemini(dummyPayload, "key_gemini");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result.error).toMatch(/^AI service unavailable: API key not valid/);
+    });
+
+    it("gives up when the time budget runs out instead of hanging", async () => {
+      // Never answers; only the abort signal ends the request.
+      globalThis.fetch = vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+          })
+      ) as unknown as typeof fetch;
+      const started = Date.now();
+      const result = await parseWithGemini(dummyPayload, "key_gemini", undefined, 50);
+      expect(Date.now() - started).toBeLessThan(1000);
+      // The first attempt is cut off at 60% of the budget so the fallback still gets its turn.
+      expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+      expect(result.error).toMatch(/^AI service unavailable/);
+    });
+
+    it("falls back to the next model when the first one hangs", async () => {
+      const mockData = { amount: 15000, category: "Other", description: "Parking", transaction_type: "expense" };
+      globalThis.fetch = vi
+        .fn()
+        .mockImplementationOnce(
+          (_url: string, init?: RequestInit) =>
+            new Promise<Response>((_, reject) => {
+              init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+            })
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(mockData) }] } }] }))
+        ) as unknown as typeof fetch;
+      const result = await parseWithGemini(dummyPayload, "key_gemini", undefined, 200);
+      expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+      expect(result.error).toBeUndefined();
+      expect(result.amount).toBe(15000);
+    });
+
     it("handles network exception / JSON parsing errors and falls back to next model", async () => {
       const mockData = {
         amount: 15000,
@@ -810,6 +897,8 @@ describe("Expense Bot Suite", () => {
     geminiStatus?: number;
     /** HTTP status for Telegram getFile (default 200). */
     getFileStatus?: number;
+    /** `file_size` reported by Telegram getFile (default: not reported). */
+    fileSize?: number;
   }
 
   /** Routes fetches by URL so tests do not depend on call order. */
@@ -818,14 +907,15 @@ describe("Expense Bot Suite", () => {
       const url = String(input);
       if (url.includes("generativelanguage") && url.includes(":generateContent")) {
         if (opts.geminiStatus && opts.geminiStatus !== 200) {
-          return new Response(JSON.stringify({ error: { message: "busy" } }), { status: opts.geminiStatus });
+          const status = opts.geminiStatus === 400 ? "INVALID_ARGUMENT" : undefined;
+          return new Response(JSON.stringify({ error: { status, message: "busy" } }), { status: opts.geminiStatus });
         }
         return new Response(
           JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(opts.gemini ?? {}) }] } }] })
         );
       }
       if (url.includes("/getFile")) {
-        return new Response(JSON.stringify({ ok: true, result: { file_path: "photos/r.jpg" } }), {
+        return new Response(JSON.stringify({ ok: true, result: { file_path: "photos/r.jpg", file_size: opts.fileSize } }), {
           status: opts.getFileStatus ?? 200,
         });
       }
@@ -858,13 +948,17 @@ describe("Expense Bot Suite", () => {
     return { fm, messages: sentMessages(fm) };
   }
 
+  // The checksum payallok buttons carry: ask the keyboard builder instead of duplicating the hash.
+  const hashOf = (ids: number[]) =>
+    payAllPrompt(ids.map((id) => ({ id, amount: 0 }) as ExpenseRow)).keyboard.inline_keyboard[0][0].callback_data.split(":")[4];
+
   const buttons = (m: SentMessage) => (m.reply_markup?.inline_keyboard ?? []).flat().map((b) => b.callback_data);
 
-  const post = (update: unknown, env: Env, ctx?: ExecutionContext) =>
+  const post = (update: unknown, env: Env, ctx?: ExecutionContext, headers: Record<string, string> = {}) =>
     worker.fetch(
       new Request("https://example.com", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...headers },
         body: JSON.stringify(update),
       }),
       env,
@@ -934,6 +1028,86 @@ describe("Expense Bot Suite", () => {
       expect(await claimTelegramUpdate(createMockD1({ runMeta: { changes: 0 } }).db, 5)).toBe(false);
     });
 
+    it("claimTelegramUpdate stores each update_id, so out-of-order and lower IDs still count as new", async () => {
+      const seen = new Set<unknown>();
+      const { db, statements } = createMockD1();
+      const claimingDb = {
+        ...db,
+        prepare: (sql: string) => {
+          const stmt = db.prepare(sql);
+          let bound: unknown[] = [];
+          return {
+            ...stmt,
+            bind(...values: unknown[]) {
+              bound = values;
+              stmt.bind(...values);
+              return this;
+            },
+            async run() {
+              const result = await stmt.run();
+              const isNew = sql.includes("INSERT OR IGNORE") && !seen.has(bound[0]);
+              if (isNew) seen.add(bound[0]);
+              return { ...result, meta: { ...result.meta, changes: isNew ? 1 : 0 } };
+            },
+          } as D1PreparedStatement;
+        },
+      } as D1Database;
+
+      expect(await claimTelegramUpdate(claimingDb, 101)).toBe(true);
+      expect(await claimTelegramUpdate(claimingDb, 100)).toBe(true);
+      expect(await claimTelegramUpdate(claimingDb, 101)).toBe(false);
+      expect(await claimTelegramUpdate(claimingDb, 5)).toBe(true);
+      // Without a prune: table, index, insert.
+      expect(statements.slice(0, 3).map((st) => st.sql.split(" ").slice(0, 3).join(" "))).toEqual([
+        "CREATE TABLE IF",
+        "CREATE INDEX IF",
+        "INSERT OR IGNORE",
+      ]);
+      expect(statements[1].sql).toContain("idx_telegram_updates_received ON telegram_updates (received_at)");
+    });
+
+    it("claimTelegramUpdate prunes old IDs only on every 100th update, in the same single batch", async () => {
+      const batchSpy = vi.fn();
+      const { db, statements } = createMockD1({ runMeta: { changes: 1 } });
+      const spied = { ...db, batch: (stmts: D1PreparedStatement[]) => (batchSpy(stmts.length), db.batch(stmts)) } as D1Database;
+      const kinds = () => statements.splice(0).map((st) => st.sql.split(" ").slice(0, 2).join(" "));
+
+      expect(await claimTelegramUpdate(spied, 200)).toBe(true);
+      expect(kinds()).toEqual(["CREATE TABLE", "CREATE INDEX", "DELETE FROM", "INSERT OR"]);
+      expect(await claimTelegramUpdate(spied, 201)).toBe(true);
+      expect(kinds()).toEqual(["CREATE TABLE", "CREATE INDEX", "INSERT OR"]);
+      expect(batchSpy.mock.calls).toEqual([[4], [3]]);
+
+      // The claim is read from the INSERT, wherever it sits in the batch.
+      const dup = createMockD1({ runMeta: { changes: 0 } });
+      expect(await claimTelegramUpdate(dup.db, 300)).toBe(false);
+    });
+
+    it("insertExpenses stores every row in one batch and returns their ids", async () => {
+      const batchSpy = vi.fn();
+      const { db, statements } = createMockD1({ runMeta: { last_row_id: 9 } });
+      const spied = { ...db, batch: (stmts: D1PreparedStatement[]) => (batchSpy(stmts.length), db.batch(stmts)) } as D1Database;
+      const ids = await insertExpenses(spied, "u1", [
+        { amount: 1000, category: "Other", description: "a" },
+        { amount: 2000, category: "Other", description: "b", paymentMethod: "credit_card" },
+      ]);
+      expect(ids).toEqual([9, 9]);
+      expect(batchSpy).toHaveBeenCalledWith(2);
+      expect(statements.map((st) => st.bindings.slice(4))).toEqual([
+        ["cash", 1],
+        ["credit_card", 0],
+      ]);
+      expect(await insertExpenses(spied, "u1", [])).toEqual([]);
+    });
+
+    it("secretMatches compares secrets exactly", () => {
+      expect(secretMatches("s3cret", "s3cret")).toBe(true);
+      expect(secretMatches("s3cre", "s3cret")).toBe(false);
+      expect(secretMatches("s3cretX", "s3cret")).toBe(false);
+      expect(secretMatches(null, "s3cret")).toBe(false);
+      expect(secretMatches("", "")).toBe(false);
+    });
+
     it("getRecentExpenses clamps the limit", async () => {
       const { db, statements } = createMockD1();
       await getRecentExpenses(db, "u1", 9999);
@@ -990,6 +1164,7 @@ describe("Expense Bot Suite", () => {
       expect(text).toContain("💳");
       expect(text).toContain("🟢");
       expect(text).toContain("Tổng chi: 55.000 ₫");
+      expect(text).toContain("• 🔴 <b>45.000 ₫</b> · Ăn uống · Phở &lt;bò&gt;");
     });
 
     it("/today shows a net surplus when refunds exceed expenses", async () => {
@@ -1092,6 +1267,7 @@ describe("Expense Bot Suite", () => {
       expect(messages[0].text).toContain("#5");
       expect(messages[0].text).toContain("20/10/2026");
       expect(messages[0].text).toContain("Tổng nợ: 450.000 ₫");
+      expect(messages[0].text).toContain("• <b>#5</b> 🔴 <b>100.000 ₫</b> · Mua sắm · Zara (20/10/2026)");
       expect(buttons(messages[0])).toEqual(["pay:5", "pay:8", "payall"]);
     });
 
@@ -1113,9 +1289,19 @@ describe("Expense Bot Suite", () => {
       });
       const { messages } = await runCommand("/pay 5, 8", db);
       expect(messages[0].text).toContain("Đã ghi nhận thanh toán");
-      expect(messages[0].text).toContain("#5: 100.000 ₫");
+      expect(messages[0].text).toContain("• <b>#5</b> 🔴 <b>100.000 ₫</b> · Khác · Dinner");
       expect(messages[0].text).toContain("Còn nợ");
       expect(statements.some((st) => st.sql.includes("UPDATE expenses"))).toBe(true);
+    });
+
+    it("/pay lists a capped number of paid bills so the message stays under Telegram's limit", async () => {
+      const many = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, amount: 100000, description: "Một khoản thẻ tín dụng khá dài dòng" }));
+      const { messages } = await runCommand("/pay 1,2", createMockD1({ allResults: many }).db);
+      expect(messages[0].text.length).toBeLessThan(4096);
+      expect(messages[0].text).toContain("Đã trả 100 khoản");
+      expect(messages[0].text).toContain("… và 80 khoản khác");
+      expect(messages[0].text).toContain("#20</b>");
+      expect(messages[0].text).not.toContain("#21</b>");
     });
 
     it("/pay all asks for confirmation first", async () => {
@@ -1123,7 +1309,7 @@ describe("Expense Bot Suite", () => {
       const { messages } = await runCommand("/pay all", db);
       expect(messages[0].text).toContain("Trả hết");
       expect(messages[0].text).toContain("100.000 ₫");
-      expect(buttons(messages[0])).toEqual(["payallok", "cancel"]);
+      expect(buttons(messages[0])).toEqual([`payallok:5:1:100000:${hashOf([5])}`, "cancel"]);
       expect(statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
 
       expect((await runCommand("/pay all", createMockD1().db)).messages[0].text).toContain("Không có khoản thẻ");
@@ -1254,14 +1440,65 @@ describe("Expense Bot Suite", () => {
     });
 
     it("card toggles between cash and credit card", async () => {
-      const toCard = await press("card:5");
+      const toCard = await press("card:5", { firstResult: row, runMeta: { changes: 1 } });
       const upd = toCard.statements.find((st) => st.sql.includes("payment_method = ?"));
       expect(upd?.bindings).toEqual(["credit_card", 0, 5, "1111"]);
       expect(String(find(toCard.calls, "editMessageText")?.text)).toContain("chưa trả");
 
-      const toCash = await press("card:5", { firstResult: { ...row, payment_method: "credit_card", is_paid: 0 } });
+      const toCash = await press("card:5", {
+        firstResult: { ...row, payment_method: "credit_card", is_paid: 0 },
+        runMeta: { changes: 1 },
+      });
       const upd2 = toCash.statements.find((st) => st.sql.includes("payment_method = ?"));
       expect(upd2?.bindings).toEqual(["cash", 1, 5, "1111"]);
+    });
+
+    it("card refuses to switch a credit card bill that was already paid", async () => {
+      const paidCard = { ...row, payment_method: "credit_card", is_paid: 1 };
+      const { calls, statements } = await press("card:5", { firstResult: paidCard, runMeta: { changes: 0 } });
+      const upd = statements.find((st) => st.sql.includes("payment_method = ?"));
+      expect(upd?.sql).toContain("NOT (COALESCE(payment_method, 'cash') = 'credit_card'");
+      expect(String(find(calls, "answerCallbackQuery")?.text)).toContain("đã được thanh toán");
+      const edited = find(calls, "editMessageText");
+      expect(String(edited?.text)).toContain("(đã trả)");
+      const kb = (edited?.reply_markup as SentMessage["reply_markup"])?.inline_keyboard.flat().map((b) => b.callback_data);
+      expect(kb).toEqual(["del:5", "cat:5"]);
+    });
+
+    it("card says the button expired when the row was deleted after the update changed nothing", async () => {
+      let reads = 0;
+      const fm = mockNetwork();
+      const mock = createMockD1({ runMeta: { changes: 0 } });
+      // First getExpenseById sees the row, the re-fetch finds it gone.
+      const prepare = mock.db.prepare.bind(mock.db);
+      const wrapped = {
+        ...mock.db,
+        prepare: (sql: string) => {
+          const stmt = prepare(sql);
+          const first = stmt.first.bind(stmt);
+          stmt.first = (async (...args: unknown[]) => {
+            const result = await (first as (...a: unknown[]) => Promise<unknown>)(...args);
+            return ++reads === 1 ? row : result;
+          }) as typeof stmt.first;
+          return stmt;
+        },
+      } as D1Database;
+      await handleCallbackQuery({ id: "cq1", data: "card:5", message: { message_id: 50, chat: { id: 1111 } } }, baseEnv(wrapped));
+      const calls = telegramCalls(fm);
+      expect(String(find(calls, "answerCallbackQuery")?.text)).toBe("Giao dịch này không còn nữa.");
+      expect(find(calls, "editMessageText")).toBeUndefined();
+      const kb = find(calls, "editMessageReplyMarkup")?.reply_markup as SentMessage["reply_markup"];
+      expect(kb?.inline_keyboard).toEqual([]);
+    });
+
+    it("transactionKeyboard hides the card toggle for refunds and paid card bills", () => {
+      const data = (tx: Parameters<typeof transactionKeyboard>[1]) =>
+        transactionKeyboard(1, tx).inline_keyboard.flat().map((b) => b.callback_data);
+      const base = { amount: 1000, category: "Other", description: "x", paymentMethod: "credit_card" };
+      expect(data({ ...base, isPaid: false })).toContain("card:1");
+      expect(data({ ...base, isPaid: true })).not.toContain("card:1");
+      expect(data({ ...base, amount: -1000, isPaid: false })).not.toContain("card:1");
+      expect(data({ ...base, paymentMethod: "cash", isPaid: true })).toContain("card:1");
     });
 
     it("pay settles one bill, payall asks, payallok settles all, cancel dismisses", async () => {
@@ -1271,12 +1508,79 @@ describe("Expense Bot Suite", () => {
 
       const ask = await press("payall", bills);
       expect(String(find(ask.calls, "sendMessage")?.text)).toContain("Trả hết");
+      const askButtons = (find(ask.calls, "sendMessage")?.reply_markup as SentMessage["reply_markup"])?.inline_keyboard.flat();
+      expect(askButtons?.[0].callback_data).toBe(`payallok:5:1:100000:${hashOf([5])}`);
 
-      const ok = await press("payallok", bills);
+      const ok = await press(`payallok:5:1:100000:${hashOf([5])}`, bills);
       expect(String(find(ok.calls, "editMessageText")?.text)).toContain("Đã ghi nhận thanh toán");
+      const upd = ok.statements.find((st) => st.sql.includes("UPDATE expenses"));
+      expect(upd?.sql).toContain("id <= ?");
+      expect(upd?.bindings).toEqual(["1111", 5]);
 
       const cancel = await press("cancel");
       expect(String(find(cancel.calls, "editMessageText")?.text)).toContain("Đã huỷ");
+    });
+
+    it("payallok pays only the bills the prompt showed, and re-asks when they changed", async () => {
+      const shown = { id: 5, amount: 100000, description: "Dinner" };
+      const later = { id: 9, amount: 5000000, description: "Laptop" };
+
+      // A bill recorded after the prompt (higher id) is left unpaid: only ids up to 5 are settled.
+      const newer = await press(`payallok:5:1:100000:${hashOf([5])}`, { allResults: [shown, later] });
+      const upd = newer.statements.find((st) => st.sql.includes("UPDATE expenses"));
+      expect(upd?.sql).toContain("id <= ?");
+      expect(upd?.bindings).toEqual(["1111", 5]);
+
+      // An older bill that became unpaid after the prompt changes count/total: nothing is paid.
+      const changed = await press(`payallok:5:1:100000:${hashOf([5])}`, { allResults: [{ ...shown, id: 3 }, shown] });
+      expect(changed.statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
+      const edit = find(changed.calls, "editMessageText");
+      expect(String(edit?.text)).toContain("đã thay đổi");
+      expect(String(edit?.text)).toContain("Trả hết <b>2</b> khoản");
+      const kb = (edit?.reply_markup as SentMessage["reply_markup"])?.inline_keyboard.flat();
+      expect(kb?.[0].callback_data).toBe(`payallok:5:2:200000:${hashOf([3, 5])}`);
+
+      // Buttons sent before this change carry no snapshot and are asked again too.
+      const legacy = await press("payallok", { allResults: [shown] });
+      expect(legacy.statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
+
+      // So do old four-field buttons, which carry no checksum.
+      const old = await press("payallok:5:1:100000", { allResults: [shown] });
+      expect(old.statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
+      expect(String(find(old.calls, "editMessageText")?.text)).toContain("đã thay đổi");
+
+      const none = await press(`payallok:5:1:100000:${hashOf([5])}`, { allResults: [] });
+      expect(String(find(none.calls, "editMessageText")?.text)).toContain("Không có khoản thẻ");
+    });
+
+    it("payallok re-asks when different bills have the same maxId, count and total", async () => {
+      // The prompt showed #5 (100k) and #9 (200k); now #7 (100k) and #9 (200k) are unpaid.
+      const now = [
+        { id: 7, amount: 100000, description: "A" },
+        { id: 9, amount: 200000, description: "B" },
+      ];
+      const { calls, statements } = await press(`payallok:9:2:300000:${hashOf([5, 9])}`, { allResults: now });
+      expect(statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
+      expect(String(find(calls, "editMessageText")?.text)).toContain("đã thay đổi");
+
+      const same = await press(`payallok:9:2:300000:${hashOf([7, 9])}`, { allResults: now });
+      expect(same.statements.some((st) => st.sql.includes("UPDATE"))).toBe(true);
+    });
+
+    it("keeps payallok callback_data within Telegram's 64 bytes for big values", () => {
+      const bills = Array.from({ length: 999 }, (_, i) => ({ id: 900_000_000 + i, amount: -1_000_000_000_000 }));
+      const { keyboard } = payAllPrompt(bills as unknown as ExpenseRow[]);
+      const data = keyboard.inline_keyboard[0][0].callback_data;
+      expect(data).toMatch(/^payallok:900000998:999:-\d+:[0-9a-f]{8}$/);
+      expect(new TextEncoder().encode(data).length).toBeLessThanOrEqual(64);
+    });
+
+    it("payallok binds a fixed number of parameters however many bills are unpaid", async () => {
+      const many = Array.from({ length: 150 }, (_, i) => ({ id: i + 1, amount: 1000, description: `b${i}` }));
+      const { statements } = await press(`payallok:150:150:150000:${hashOf(many.map((r) => r.id))}`, { allResults: many });
+      // D1 allows at most 100 bound parameters per query.
+      expect(Math.max(...statements.map((st) => st.bindings.length))).toBeLessThanOrEqual(2);
+      expect(statements.some((st) => st.sql.includes("UPDATE expenses") && st.sql.includes("id <= ?"))).toBe(true);
     });
 
     it("answers (and does nothing else) for malformed or message-less queries", async () => {
@@ -1382,16 +1686,60 @@ describe("Expense Bot Suite", () => {
         expect(insert?.bindings).toEqual(["iphone_user", 45000, "Food & Dining", "Lunch", "cash", 1]);
       });
 
-      it("stores under SHORTCUT_USER_ID, then ADMIN_CHAT_ID, unless user_id is sent", async () => {
+      it("stores authenticated requests under SHORTCUT_USER_ID, then ADMIN_CHAT_ID, unless user_id is sent", async () => {
         const userOf = async (extra: Partial<Env>, body: Record<string, unknown> = {}) => {
           mockNetwork({ gemini: { transactions: [expenseItem()] } });
           const { db, statements } = createMockD1();
-          await post(shortcut(body), baseEnv(db, extra));
+          await post(shortcut(body), baseEnv(db, { SHORTCUT_SECRET: "s3cret", ...extra }), undefined, {
+            Authorization: "Bearer s3cret",
+          });
           return statements.find((st) => st.sql.includes("INSERT INTO expenses"))?.bindings[0];
         };
         expect(await userOf({ ADMIN_CHAT_ID: "7777" })).toBe("7777");
         expect(await userOf({ ADMIN_CHAT_ID: "7777", SHORTCUT_USER_ID: "8888" })).toBe("8888");
         expect(await userOf({ ADMIN_CHAT_ID: "7777", SHORTCUT_USER_ID: "8888" }, { user_id: "alice" })).toBe("alice");
+      });
+
+      it("never writes unauthenticated requests to the admin's ledger", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        const { db, statements } = createMockD1();
+        const env = baseEnv(db, { ADMIN_CHAT_ID: "7777", SHORTCUT_USER_ID: "8888" });
+        const res = await post(shortcut(), env);
+        expect(statements.find((st) => st.sql.includes("INSERT INTO expenses"))?.bindings[0]).toBe("iphone_user");
+        expect(await res.text()).toContain("SHORTCUT_SECRET");
+
+        // Naming a ledger directly needs the secret too.
+        const named = await post(shortcut({ user_id: "7777" }), env);
+        expect(named.status).toBe(401);
+        expect(statements.filter((st) => st.sql.includes("INSERT INTO expenses"))).toHaveLength(1);
+      });
+
+      it("accepts a numeric user_id and rejects other non-string types with 400", async () => {
+        // Without a secret a user_id is refused, but cleanly (401), not by crashing into a fake "OK".
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        const open = await post(shortcut({ user_id: 123456 }), baseEnv(createMockD1().db));
+        expect(open.status).toBe(401);
+        expect((await post(shortcut({ user_id: { a: 1 } }), baseEnv(createMockD1().db))).status).toBe(400);
+        expect(fm).not.toHaveBeenCalled();
+
+        const { db, statements } = createMockD1();
+        const env = baseEnv(db, { SHORTCUT_SECRET: "s3cret" });
+        const auth = { Authorization: "Bearer s3cret" };
+        const ok = await post(shortcut({ user_id: 123456 }), env, undefined, auth);
+        expect(ok.status).toBe(200);
+        expect(statements.find((st) => st.sql.includes("INSERT INTO expenses"))?.bindings[0]).toBe("123456");
+        expect((await post(shortcut({ user_id: ["x"] }), env, undefined, auth)).status).toBe(400);
+        expect((await post(shortcut({ user_id: null }), env, undefined, auth)).status).toBe(200);
+      });
+
+      it("rejects requests without the right secret when SHORTCUT_SECRET is set", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        const env = baseEnv(createMockD1().db, { SHORTCUT_SECRET: "s3cret", ADMIN_CHAT_ID: "7777" });
+        expect((await post(shortcut(), env)).status).toBe(401);
+        expect((await post(shortcut(), env, undefined, { Authorization: "Bearer wrong" })).status).toBe(401);
+        expect(fm).not.toHaveBeenCalled();
+        expect((await post(shortcut(), env, undefined, { Authorization: "Bearer s3cret" })).status).toBe(200);
       });
 
       it("saves refunds as negative amounts", async () => {
@@ -1433,6 +1781,7 @@ describe("Expense Bot Suite", () => {
         const { db, statements } = createMockD1();
         const text = await (await post(shortcut(), baseEnv(db))).text();
         expect(statements.filter((st) => st.sql.includes("INSERT INTO expenses"))).toHaveLength(2);
+        expect(text.split("Đã ghi")).toHaveLength(3);
         expect(text).toContain("Cafe");
         expect(text).toContain("Gửi xe");
       });
@@ -1629,6 +1978,26 @@ describe("Expense Bot Suite", () => {
         expect(sentMessages(fm)[0].text).toContain("Đã ghi");
       });
 
+      it("does not fetch a photo whose reported size is too large, and only tells private chats", async () => {
+        const send = async (type: string) => {
+          const fm = mockNetwork({ fileSize: 15 * 1024 * 1024, gemini: { transactions: [expenseItem()] } });
+          await post({ message: { chat: { id: 5, type }, photo: [{ file_id: "p" }] } }, baseEnv(createMockD1().db));
+          expect(fm.mock.calls.some(([u]) => String(u).includes("/file/bot"))).toBe(false);
+          expect(fm.mock.calls.some(([u]) => String(u).includes(":generateContent"))).toBe(false);
+          return sentMessages(fm);
+        };
+        const priv = await send("private");
+        expect(priv).toHaveLength(1);
+        expect(priv[0].text).toContain("quá lớn");
+        expect(await send("supergroup")).toHaveLength(0);
+      });
+
+      it("downloadTelegramFileAsBase64 also checks the downloaded size against maxBytes", async () => {
+        mockNetwork();
+        await expect(downloadTelegramFileAsBase64("f", "tok", 1000, 2)).rejects.toThrow(FileTooLargeError);
+        expect(await downloadTelegramFileAsBase64("f", "tok", 1000, 3)).toBe("AQID");
+      });
+
       it("tells the user when the photo cannot be downloaded", async () => {
         vi.spyOn(console, "error").mockImplementation(() => {});
         const fm = mockNetwork({ getFileStatus: 500 });
@@ -1636,16 +2005,69 @@ describe("Expense Bot Suite", () => {
         expect(sentMessages(fm)[0].text).toContain("không tải được ảnh");
       });
 
-      it("replies to unsupported content (stickers, non-image files) instead of staying silent", async () => {
+      it("replies to unsupported content (stickers, non-image files) in private chats", async () => {
         const fm = mockNetwork();
-        await post({ message: { chat: { id: 5 }, sticker: {} } }, baseEnv(createMockD1().db));
+        await post({ message: { chat: { id: 5, type: "private" }, sticker: {} } }, baseEnv(createMockD1().db));
         await post(
-          { message: { chat: { id: 5 }, document: { file_id: "d", mime_type: "application/pdf" } } },
+          { message: { chat: { id: 5, type: "private" }, document: { file_id: "d", mime_type: "application/pdf" } } },
           baseEnv(createMockD1().db)
         );
         const messages = sentMessages(fm);
         expect(messages).toHaveLength(2);
         expect(messages.every((m) => m.text.includes("văn bản và ảnh"))).toBe(true);
+      });
+
+      it("stays silent for service updates and for unsupported content in groups", async () => {
+        const fm = mockNetwork();
+        const group = { id: -100, type: "supergroup" };
+        for (const message of [
+          { chat: group, new_chat_members: [{ id: 1 }] },
+          { chat: group, pinned_message: { message_id: 1 } },
+          { chat: group, new_chat_title: "Chi tiêu" },
+          { chat: group, sticker: {} },
+          { chat: { id: 5, type: "private" }, pinned_message: { message_id: 1 } },
+        ]) {
+          await post({ message }, baseEnv(createMockD1().db));
+        }
+        expect(fm).not.toHaveBeenCalled();
+      });
+
+      it("rejects image files Gemini cannot read before downloading them", async () => {
+        const send = async (document: Record<string, unknown>) => {
+          const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+          await post({ message: { chat: { id: 5, type: "private" }, document } }, baseEnv(createMockD1().db));
+          expect(fm.mock.calls.some(([u]) => String(u).includes("getFile"))).toBe(false);
+          return sentMessages(fm)[0].text;
+        };
+        for (const mime_type of ["image/svg+xml", "image/gif", "image/bmp", "image/tiff"]) {
+          expect(await send({ file_id: "d", mime_type })).toContain("JPG, PNG, WEBP");
+        }
+        expect(await send({ file_id: "d", mime_type: "image/png", file_size: 15 * 1024 * 1024 })).toContain("quá lớn");
+      });
+
+      it("does not complain about image files or GIFs shared in groups", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        const group = { id: -100, type: "group" };
+        await post({ message: { chat: group, document: { file_id: "d", mime_type: "image/svg+xml" } } }, baseEnv(createMockD1().db));
+        await post(
+          { message: { chat: group, animation: { file_id: "a" }, document: { file_id: "a", mime_type: "image/gif" } } },
+          baseEnv(createMockD1().db)
+        );
+        expect(fm).not.toHaveBeenCalled();
+      });
+
+      it("tells the user when every model rejects the image instead of blaming overload", async () => {
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        const fm = mockNetwork({ geminiStatus: 400 });
+        await post(
+          { message: { chat: { id: 5 }, document: { file_id: "d", mime_type: "image/jpg" } } },
+          baseEnv(createMockD1().db)
+        );
+        const gemini = fm.mock.calls.find(([u]) => String(u).includes(":generateContent"));
+        expect(String(gemini?.[1]?.body)).toContain('"mime_type":"image/jpeg"');
+        const text = sentMessages(fm)[0].text;
+        expect(text).toContain("không xử lý được");
+        expect(text).not.toContain("quá tải");
       });
 
       it("informs the user when the database insert fails", async () => {
@@ -1660,6 +2082,26 @@ describe("Expense Bot Suite", () => {
         expect(sentMessages(fm)[0].text).toContain("Không lưu được");
       });
 
+      it("saves several transactions in one batch and confirms none if it fails", async () => {
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        const fm = mockNetwork({
+          gemini: { transactions: [expenseItem({ description: "Cafe" }), expenseItem({ description: "Gửi xe" }), expenseItem({ description: "Trưa" })] },
+        });
+        let inserted = 0;
+        const { db } = createMockD1({
+          onExecute: (st) => {
+            if (st.sql.includes("INSERT INTO expenses") && ++inserted === 3) throw new Error("D1 hiccup");
+          },
+        });
+        const batchSpy = vi.spyOn(db, "batch");
+        await post(textUpdate("Cafe 30k, gửi xe 5k, ăn trưa 50k"), baseEnv(db));
+        expect(batchSpy).toHaveBeenCalledTimes(1);
+        expect(batchSpy.mock.calls[0][0]).toHaveLength(3);
+        const messages = sentMessages(fm);
+        expect(messages).toHaveLength(1);
+        expect(messages[0].text).toContain("Không lưu được");
+      });
+
       it("skips an update_id that was already claimed (Telegram retry)", async () => {
         const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
         const retry = createMockD1({ runMeta: { changes: 0 } });
@@ -1670,6 +2112,25 @@ describe("Expense Bot Suite", () => {
         const fresh = createMockD1({ runMeta: { changes: 1 } });
         await post(textUpdate("x", { update_id: 11 }), baseEnv(fresh.db));
         expect(inserts(fresh.statements)).toHaveLength(1);
+      });
+
+      it("rejects updates without Telegram's secret header when TELEGRAM_WEBHOOK_SECRET is set", async () => {
+        const fm = mockNetwork({ gemini: { transactions: [expenseItem()] } });
+        const { db, statements } = createMockD1({ runMeta: { changes: 1 } });
+        const env = baseEnv(db, { TELEGRAM_WEBHOOK_SECRET: "hook-secret" });
+
+        const forged = await post(textUpdate("x", { update_id: 9007199254740991 }), env);
+        expect(forged.status).toBe(401);
+        const wrong = await post(textUpdate(), env, undefined, { "X-Telegram-Bot-Api-Secret-Token": "nope" });
+        expect(wrong.status).toBe(401);
+        expect(statements).toHaveLength(0);
+        expect(fm).not.toHaveBeenCalled();
+
+        const real = await post(textUpdate("x", { update_id: 12 }), env, undefined, {
+          "X-Telegram-Bot-Api-Secret-Token": "hook-secret",
+        });
+        expect(await real.text()).toBe("OK");
+        expect(inserts(statements)).toHaveLength(1);
       });
 
       it("processes in ctx.waitUntil so the webhook returns without waiting", async () => {

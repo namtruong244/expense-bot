@@ -62,6 +62,20 @@ export const FALLBACK_GEMINI_MODEL = "gemini-2.5-flash";
 /** Maximum number of models tried for a single request. */
 export const MAX_GEMINI_ATTEMPTS = 3;
 
+/**
+ * Time budgets for work done after the webhook has been answered. ctx.waitUntil() only gets 30 seconds,
+ * so the photo download plus every Gemini attempt must finish well within it and still leave time to reply.
+ */
+export const TELEGRAM_PROCESSING_BUDGET_MS = 24_000;
+export const TELEGRAM_DOWNLOAD_TIMEOUT_MS = 6_000;
+export const GEMINI_TIMEOUT_MS = 18_000;
+
+/** Image formats Gemini accepts as inline data. */
+export const SUPPORTED_IMAGE_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
+
+/** Largest receipt image sent to Gemini (inline requests are capped at 20 MB after base64 encoding). */
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
 /** Valid Gemini model id (also guarantees it is safe to place in a URL path). */
 export const GEMINI_MODEL_NAME_PATTERN = /^gemini-[a-z0-9][a-z0-9._-]{0,63}$/;
 

@@ -47,10 +47,15 @@ export const MSG = {
   aiUnavailable: "⏳ Dịch vụ AI đang quá tải hoặc chưa sẵn sàng. Bạn thử lại sau ít phút nhé.",
   genericError: "⚠️ Có lỗi xảy ra, bạn thử lại sau nhé.",
   photoFailed: "⚠️ Mình không tải được ảnh hoá đơn. Bạn thử gửi lại nhé.",
+  imageUnsupported: "🖼 Mình chỉ đọc được ảnh JPG, PNG, WEBP hoặc HEIC. Bạn gửi lại ảnh ở một trong các định dạng này nhé.",
+  imageTooLarge: "🖼 Ảnh quá lớn (tối đa 10 MB). Bạn gửi ảnh nhỏ hơn, hoặc gửi dạng ảnh thường thay vì file nhé.",
+  aiRejected: "⚠️ AI không xử lý được nội dung này. Nếu là ảnh, bạn thử gửi ảnh JPG/PNG rõ nét hơn nhé.",
   saveFailed: "⚠️ Không lưu được giao dịch. Bạn thử lại nhé.",
   dbMissing: "⚠️ Chưa kết nối được cơ sở dữ liệu.",
   adminOnly: "⛔ Chỉ quản trị viên bot mới được đổi model Gemini (cần đặt ADMIN_CHAT_ID là chat ID của bạn).",
   buttonExpired: "Giao dịch này không còn nữa.",
+  cardAlreadyPaid: "Khoản thẻ này đã được thanh toán nên không đổi được nữa.",
+  payAllChanged: "⚠️ Danh sách khoản chưa trả đã thay đổi, bạn xác nhận lại nhé.",
   cancelled: "Đã huỷ.",
 } as const;
 
@@ -58,6 +63,7 @@ export const MSG = {
 export function friendlyParseError(error: string): string {
   if (error === "cannot_parse") return MSG.cannotParse;
   if (error.startsWith("AI service unavailable")) return MSG.aiUnavailable;
+  if (error.startsWith("AI request rejected")) return MSG.aiRejected;
   return MSG.genericError;
 }
 
@@ -130,7 +136,10 @@ export function savedText(tx: SavedTransaction, html: boolean): string {
   return text;
 }
 
-/** Buttons shown under a saved transaction: undo, change category, toggle credit card. */
+/**
+ * Buttons shown under a saved transaction: undo, change category, toggle credit card.
+ * The toggle is hidden for refunds and for credit card bills that were already paid.
+ */
 export function transactionKeyboard(id: number, tx: SavedTransaction): InlineKeyboard {
   const rows = [
     [
@@ -138,8 +147,8 @@ export function transactionKeyboard(id: number, tx: SavedTransaction): InlineKey
       { text: "🏷 Đổi danh mục", callback_data: `cat:${id}` },
     ],
   ];
-  if (tx.amount >= 0) {
-    const isCard = tx.paymentMethod === "credit_card";
+  const isCard = tx.paymentMethod === "credit_card";
+  if (tx.amount >= 0 && !(isCard && tx.isPaid)) {
     rows.push([
       isCard
         ? { text: "💵 Chuyển thành tiền mặt", callback_data: `card:${id}` }

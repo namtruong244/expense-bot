@@ -8,7 +8,6 @@ import {
   savedText,
   transactionKeyboard,
 } from "../messages";
-import { formatCurrency } from "../formatters";
 import {
   deleteExpenseById,
   getExpenseById,
@@ -23,7 +22,7 @@ import {
   sendTelegram,
 } from "../services/telegram";
 import { Env, ExpenseRow, TelegramCallbackQuery } from "../types";
-import { payAllConfirmKeyboard, payBills } from "./commands";
+import { confirmedPayAllMaxId, payAllPrompt, payBills, sendPayAllConfirm } from "./commands";
 
 /**
  * Handles inline keyboard button presses. Callback data format:
@@ -31,10 +30,10 @@ import { payAllConfirmKeyboard, payBills } from "./commands";
  *   cat:<id>            open the category picker
  *   setcat:<id>:<index> set the category (index into CATEGORIES)
  *   back:<id>           close the category picker
- *   card:<id>           toggle cash <-> credit card
+ *   card:<id>           toggle cash <-> credit card (not for bills already paid)
  *   pay:<id>            pay one credit card bill
  *   payall              ask to confirm paying every bill (see /pay all)
- *   payallok            pay every bill
+ *   payallok:<maxId>:<count>:<total>  pay the bills the prompt showed
  *   cancel              dismiss a confirmation
  * Every query is scoped to the chat that pressed the button.
  */
@@ -42,7 +41,8 @@ export async function handleCallbackQuery(query: TelegramCallbackQuery, env: Env
   const token = env.TELEGRAM_BOT_TOKEN;
   const chatId = query.message?.chat?.id;
   const messageId = query.message?.message_id;
-  const [action = "", rawId = "", rawArg = ""] = (query.data || "").split(":");
+  const [action = "", ...args] = (query.data || "").split(":");
+  const [rawId = "", rawArg = ""] = args;
 
   if (!chatId || !messageId || !env.DB) {
     await answerCallbackQuery(token, query.id);
@@ -61,29 +61,33 @@ export async function handleCallbackQuery(query: TelegramCallbackQuery, env: Env
 
     if (action === "payall") {
       await answerCallbackQuery(token, query.id);
-      const unpaid = await getUnpaidCreditCardExpenses(env.DB, userId);
-      if (!unpaid.length) {
-        await sendTelegram(token, chatId, MSG.noDebtToPay);
-        return;
-      }
-      const total = unpaid.reduce((sum, r) => sum + (Number.isFinite(r.amount) ? r.amount : 0), 0);
-      await sendTelegram(
-        token,
-        chatId,
-        `💳 Trả hết <b>${unpaid.length}</b> khoản, tổng <b>${formatCurrency(total)}</b>?`,
-        payAllConfirmKeyboard()
-      );
+      await sendPayAllConfirm(env.DB, token, chatId, userId);
       return;
     }
 
-    if (action === "payallok" || action === "pay") {
+    if (action === "payallok") {
       await answerCallbackQuery(token, query.id);
-      const text = await payBills(env.DB, userId, action === "pay" ? [id] : "all");
-      if (action === "payallok") {
-        await editTelegramMessage(token, chatId, messageId, text ?? MSG.noDebtToPay);
-      } else {
-        await sendTelegram(token, chatId, text ?? MSG.payNotFound);
+      const unpaid = await getUnpaidCreditCardExpenses(env.DB, userId);
+      if (!unpaid.length) {
+        await editTelegramMessage(token, chatId, messageId, MSG.noDebtToPay);
+        return;
       }
+      const maxId = confirmedPayAllMaxId(unpaid, args);
+      if (maxId === null) {
+        // Bills changed since the prompt (or it predates this check): ask again with the current list.
+        const prompt = payAllPrompt(unpaid);
+        await editTelegramMessage(token, chatId, messageId, `${MSG.payAllChanged}\n\n${prompt.text}`, prompt.keyboard);
+        return;
+      }
+      const text = await payBills(env.DB, userId, { upToId: maxId });
+      await editTelegramMessage(token, chatId, messageId, text ?? MSG.noDebtToPay);
+      return;
+    }
+
+    if (action === "pay") {
+      await answerCallbackQuery(token, query.id);
+      const text = await payBills(env.DB, userId, [id]);
+      await sendTelegram(token, chatId, text ?? MSG.payNotFound);
       return;
     }
 
@@ -129,7 +133,20 @@ export async function handleCallbackQuery(query: TelegramCallbackQuery, env: Env
       }
       case "card": {
         const toCard = row.payment_method !== "credit_card";
-        await updateExpensePayment(env.DB, userId, id, toCard ? "credit_card" : "cash");
+        const changed = await updateExpensePayment(env.DB, userId, id, toCard ? "credit_card" : "cash");
+        if (!changed) {
+          const current = await getExpenseById(env.DB, userId, id);
+          if (!current) {
+            // Deleted since the button was pressed: nothing to switch, and the buttons are dead.
+            await answerCallbackQuery(token, query.id, MSG.buttonExpired);
+            await editTelegramKeyboard(token, chatId, messageId, { inline_keyboard: [] });
+            return;
+          }
+          // Already paid by card (e.g. via /pay): switching it would erase the payment.
+          await answerCallbackQuery(token, query.id, MSG.cardAlreadyPaid);
+          await refreshTransactionMessage(env, chatId, messageId, current);
+          return;
+        }
         await answerCallbackQuery(token, query.id, toCard ? "Đã chuyển sang thẻ tín dụng" : "Đã chuyển sang tiền mặt");
         await refreshTransactionMessage(env, chatId, messageId, {
           ...row,

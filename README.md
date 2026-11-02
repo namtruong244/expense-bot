@@ -16,7 +16,7 @@
 - **📱 Apple Shortcuts Integration**: Direct webhook endpoint (`source: "shortcut"`) allowing 1-tap expense logging via iPhone Action Button, Siri, or Share Sheet with instant notifications.
 - **🖱 Inline buttons & feedback**: undo / change category / toggle credit card under each entry, "typing…" indicator while the AI works, friendly Vietnamese messages and HTML-safe formatting.
 - **🧾 Multi-transaction & back-dated entries**: one message can record several purchases and dates such as "hôm qua".
-- **🔁 Safe webhook**: replies immediately (`ctx.waitUntil`) and ignores Telegram retries by `update_id`.
+- **🔁 Safe webhook**: checks Telegram's secret token, replies immediately (`ctx.waitUntil`, with time budgets so every message gets an answer) and ignores Telegram retries by `update_id`.
 - **⚡ Serverless & Global**: Runs on Cloudflare's global edge network with sub-second execution and Cloudflare D1 distributed SQLite storage.
 - **🛡️ 100% Type-Safe & Clean Architecture**: Strict TypeScript without `any` types, modular structure (services, handlers, formatters), and 110+ comprehensive unit tests with Vitest.
 
@@ -148,15 +148,21 @@ npx wrangler secret put GEMINI_API_KEY
 
 # Your Telegram chat ID: only this chat can change the Gemini model via /model
 npx wrangler secret put ADMIN_CHAT_ID
+
+# Random string (A-Z, a-z, 0-9, _ and -, up to 256 chars) that Telegram sends with every update.
+# Once set, requests without it are rejected; pass the same value as secret_token in step 6.
+# Strongly recommended: without it anyone who knows the Worker URL can post fake updates.
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 ```
 
-Optionally, store Apple Shortcut entries under your Telegram chat so they appear in `/today`, `/month` and `/debt` (defaults to `ADMIN_CHAT_ID` when unset):
+To store Apple Shortcut entries under your Telegram chat (so they appear in `/today`, `/month` and `/debt`), set a Shortcut secret. Only requests carrying it may write to a Telegram ledger: `user_id` if sent, else `SHORTCUT_USER_ID`, else `ADMIN_CHAT_ID`. Without a secret the endpoint is public, entries go to a separate `iphone_user` ledger, and requests that send `user_id` are refused (HTTP 401):
 
 ```bash
-npx wrangler secret put SHORTCUT_USER_ID
+npx wrangler secret put SHORTCUT_SECRET
+npx wrangler secret put SHORTCUT_USER_ID   # optional
 ```
 
-> `app_config` must exist in D1 (it is part of `schema.sql`); re-run the schema on existing databases.
+> `app_config` must exist in D1 (it is part of `schema.sql`); re-run the schema on existing databases. `telegram_updates` (Telegram retry de-duplication) is also in `schema.sql` and is created automatically if missing.
 
 ### 5. Deploy to Cloudflare Workers
 
@@ -174,8 +180,11 @@ Link your Telegram Bot to your Cloudflare Worker:
 
 ```bash
 curl -F "url=https://expense-bot.<your-subdomain>.workers.dev" \
+  -F "secret_token=<YOUR_TELEGRAM_WEBHOOK_SECRET>" \
   https://api.telegram.org/bot<YOUR_TELEGRAM_BOT_TOKEN>/setWebhook
 ```
+
+> Set `TELEGRAM_WEBHOOK_SECRET` and register the webhook with the same `secret_token` together: if only the Worker has it, every Telegram update gets HTTP 401.
 
 You can verify webhook health anytime:
 
@@ -195,11 +204,11 @@ You can log expenses directly from iOS or macOS without opening Telegram:
    - **Get Contents of URL**:
      - **URL**: `https://expense-bot.<your-subdomain>.workers.dev`
      - **Method**: `POST`
-     - **Headers**: `Content-Type: application/json`
+     - **Headers**: `Content-Type: application/json` and, if you set `SHORTCUT_SECRET`, `Authorization: Bearer <SHORTCUT_SECRET>`
      - **Request Body**: `JSON`
        - `source` (Text): `shortcut`
        - `text` (Text): `Provided Input`
-       - `user_id` (Text, optional): your Telegram chat ID. Leave it out to use `SHORTCUT_USER_ID` / `ADMIN_CHAT_ID`, otherwise entries are stored separately from Telegram's
+       - `user_id` (Text, optional, requires `SHORTCUT_SECRET`): the Telegram chat ID to store under. Leave it out to use `SHORTCUT_USER_ID` / `ADMIN_CHAT_ID`
        - `payment_method` (Text, optional): `credit_card`
    - **Show Notification**: Display the text returned from the URL (errors use HTTP 4xx/5xx, so you can branch on the status code).
 3. Assign the shortcut to your iPhone's **Action Button**, **Back Tap**, or home screen widget!

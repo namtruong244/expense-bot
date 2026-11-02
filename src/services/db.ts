@@ -1,5 +1,36 @@
 import { CategorySummaryRow, ExpenseRow } from "../types";
 
+/** A transaction to insert with {@link insertExpenses}. */
+export interface ExpenseInsert {
+  amount: number;
+  category: string;
+  description: string;
+  paymentMethod?: string;
+  isPaid?: number;
+  createdAt?: string;
+}
+
+function prepareExpenseInsert(db: D1Database, userId: string, row: ExpenseInsert): D1PreparedStatement {
+  const safeUserId = (userId || "").trim() || "unknown_user";
+  const safeAmount = typeof row.amount === "number" && Number.isFinite(row.amount) ? row.amount : 0;
+  const safeCategory = (row.category || "").trim() || "Other";
+  const safeDescription = (row.description || "").trim() || "Transaction";
+  const safeMethod = (row.paymentMethod || "").trim() || "cash";
+  const safeIsPaid = row.isPaid !== undefined ? (row.isPaid ? 1 : 0) : (safeMethod === "credit_card" ? 0 : 1);
+
+  return row.createdAt
+    ? db
+        .prepare(
+          "INSERT INTO expenses (user_id, amount, category, description, payment_method, is_paid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(safeUserId, safeAmount, safeCategory, safeDescription, safeMethod, safeIsPaid, row.createdAt)
+    : db
+        .prepare(
+          "INSERT INTO expenses (user_id, amount, category, description, payment_method, is_paid) VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        .bind(safeUserId, safeAmount, safeCategory, safeDescription, safeMethod, safeIsPaid);
+}
+
 /**
  * Inserts a new transaction record into the expenses table.
  *
@@ -23,27 +54,27 @@ export async function insertExpense(
   isPaid?: number,
   createdAt?: string
 ): Promise<number> {
-  const safeUserId = (userId || "").trim() || "unknown_user";
-  const safeAmount = typeof amount === "number" && Number.isFinite(amount) ? amount : 0;
-  const safeCategory = (category || "").trim() || "Other";
-  const safeDescription = (description || "").trim() || "Transaction";
-  const safeMethod = (paymentMethod || "").trim() || "cash";
-  const safeIsPaid = isPaid !== undefined ? (isPaid ? 1 : 0) : (safeMethod === "credit_card" ? 0 : 1);
-
-  const result = createdAt
-    ? await db
-        .prepare(
-          "INSERT INTO expenses (user_id, amount, category, description, payment_method, is_paid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(safeUserId, safeAmount, safeCategory, safeDescription, safeMethod, safeIsPaid, createdAt)
-        .run()
-    : await db
-        .prepare(
-          "INSERT INTO expenses (user_id, amount, category, description, payment_method, is_paid) VALUES (?, ?, ?, ?, ?, ?)"
-        )
-        .bind(safeUserId, safeAmount, safeCategory, safeDescription, safeMethod, safeIsPaid)
-        .run();
+  const result = await prepareExpenseInsert(db, userId, {
+    amount,
+    category,
+    description,
+    paymentMethod,
+    isPaid,
+    createdAt,
+  }).run();
   return result?.meta?.last_row_id ?? 0;
+}
+
+/**
+ * Inserts several transactions in one D1 batch (a single SQL transaction): either all rows are
+ * stored or none are, so a failed message can be resent without creating duplicates.
+ *
+ * @returns The new row IDs in input order (0 where the driver did not report one).
+ */
+export async function insertExpenses(db: D1Database, userId: string, rows: ExpenseInsert[]): Promise<number[]> {
+  if (rows.length === 0) return [];
+  const results = await db.batch(rows.map((row) => prepareExpenseInsert(db, userId, row)));
+  return rows.map((_, i) => results[i]?.meta?.last_row_id ?? 0);
 }
 
 /**
@@ -168,35 +199,52 @@ export async function updateExpenseCategory(
     .run();
 }
 
-/** Switches a user's transaction between cash (settled) and credit card (unpaid debt). */
+/**
+ * Switches a user's transaction between cash (settled) and credit card (unpaid debt).
+ * Credit card bills that were already paid are left alone, so the payment record is never lost.
+ *
+ * @returns true if the row was changed.
+ */
 export async function updateExpensePayment(
   db: D1Database,
   userId: string,
   id: number,
   paymentMethod: "cash" | "credit_card"
-): Promise<void> {
+): Promise<boolean> {
   const isPaid = paymentMethod === "credit_card" ? 0 : 1;
-  await db
-    .prepare("UPDATE expenses SET payment_method = ?, is_paid = ?, paid_at = NULL WHERE id = ? AND user_id = ?")
+  const result = await db
+    .prepare(
+      `UPDATE expenses SET payment_method = ?, is_paid = ?, paid_at = NULL
+       WHERE id = ? AND user_id = ?
+         AND NOT (COALESCE(payment_method, 'cash') = 'credit_card' AND COALESCE(is_paid, 1) <> 0)`
+    )
     .bind(paymentMethod, isPaid, id, (userId || "").trim())
     .run();
+  return (result?.meta?.changes ?? 1) > 0;
 }
 
 /**
- * Records a Telegram update_id as handled. Returns false when the same (or a newer) update was
- * already claimed, i.e. Telegram retried a webhook that is being or has been processed.
- * Atomic: the conditional upsert only changes the row when the stored ID is older.
+ * Records a Telegram update_id as handled. Returns false when this exact update was already
+ * claimed, i.e. Telegram retried a webhook that is being or has been processed.
+ * Each ID is stored on its own, so updates delivered out of order (parallel connections) or with
+ * a lower ID (Telegram restarts the sequence after a quiet week) are still processed.
+ * IDs older than six days are pruned now and then (every 100th update ID), well before Telegram could restart
+ * the sequence after a quiet week. The table and its index are created on demand so databases that predate
+ * them keep de-duplicating without a manual migration. Everything is one batch, i.e. one round trip.
  */
 export async function claimTelegramUpdate(db: D1Database, updateId: number): Promise<boolean> {
-  const result = await db
-    .prepare(
-      `INSERT INTO app_config (key, value, updated_at) VALUES ('telegram_last_update_id', ?, CURRENT_TIMESTAMP)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
-       WHERE CAST(app_config.value AS INTEGER) < CAST(excluded.value AS INTEGER)`
-    )
-    .bind(String(updateId))
-    .run();
-  return (result?.meta?.changes ?? 1) > 0;
+  const statements = [
+    db.prepare(
+      "CREATE TABLE IF NOT EXISTS telegram_updates (update_id INTEGER PRIMARY KEY, received_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+    ),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_telegram_updates_received ON telegram_updates (received_at)"),
+  ];
+  if (updateId % 100 === 0) {
+    statements.push(db.prepare("DELETE FROM telegram_updates WHERE received_at < datetime('now', '-6 days')"));
+  }
+  statements.push(db.prepare("INSERT OR IGNORE INTO telegram_updates (update_id) VALUES (?)").bind(updateId));
+  const results = await db.batch(statements);
+  return (results[statements.length - 1]?.meta?.changes ?? 1) > 0;
 }
 
 /**
@@ -290,33 +338,24 @@ export async function payCreditCardExpenses(
 }
 
 /**
- * Marks all unpaid credit card transactions as paid for a user.
- * Returns the list of all rows that were settled.
+ * Marks every unpaid credit card transaction with an ID up to `maxId` as paid (a confirmed "pay all").
+ * Uses a fixed number of parameters, so any number of bills fits in one query, and selects and
+ * updates in one transaction so the returned rows are exactly the ones settled.
  */
-export async function payAllCreditCardExpenses(
-  db: D1Database,
-  userId: string
-): Promise<ExpenseRow[]> {
+export async function payCreditCardExpensesUpTo(db: D1Database, userId: string, maxId: number): Promise<ExpenseRow[]> {
+  if (!Number.isInteger(maxId) || maxId <= 0) return [];
   const safeUserId = (userId || "").trim();
-  const selectQuery = `
-    SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
-    FROM expenses
-    WHERE user_id = ? AND payment_method = 'credit_card' AND is_paid = 0
-    ORDER BY id ASC
-  `;
-  const result = await db.prepare(selectQuery).bind(safeUserId).all<ExpenseRow>();
-  const toPayRows = Array.isArray(result?.results) ? result.results : [];
-
-  if (toPayRows.length > 0) {
-    const updateQuery = `
-      UPDATE expenses
-      SET is_paid = 1, paid_at = CURRENT_TIMESTAMP
-      WHERE user_id = ? AND payment_method = 'credit_card' AND is_paid = 0
-    `;
-    await db.prepare(updateQuery).bind(safeUserId).run();
-  }
-
-  return toPayRows;
+  const where = "user_id = ? AND payment_method = 'credit_card' AND is_paid = 0 AND id <= ?";
+  const [selected] = await db.batch<ExpenseRow>([
+    db
+      .prepare(
+        `SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
+         FROM expenses WHERE ${where} ORDER BY id ASC`
+      )
+      .bind(safeUserId, maxId),
+    db.prepare(`UPDATE expenses SET is_paid = 1, paid_at = CURRENT_TIMESTAMP WHERE ${where}`).bind(safeUserId, maxId),
+  ]);
+  return Array.isArray(selected?.results) ? selected.results : [];
 }
 
 /**

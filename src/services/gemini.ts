@@ -7,6 +7,7 @@ import {
   FALLBACK_GEMINI_MODEL,
   GEMINI_EXPENSE_SCHEMA,
   GEMINI_MODEL_NAME_PATTERN,
+  GEMINI_TIMEOUT_MS,
   MAX_GEMINI_ATTEMPTS,
   SYSTEM_PROMPT,
 } from "../constants";
@@ -29,7 +30,7 @@ export async function fetchAvailableGeminiModels(apiKey: string): Promise<string
   }
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey.trim())}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS) });
   if (!res.ok) {
     throw new Error(`Failed to fetch models from Google: HTTP ${res.status}`);
   }
@@ -142,11 +143,17 @@ function normalizeAmount(data: ExpenseData): void {
 /**
  * Sends message text or image payload to Google Gemini API to parse financial transaction details.
  * Dynamically resolves model sequence and automatically falls back if primary models are busy or deprecated.
+ * All attempts share one `timeoutMs` budget so the caller always gets an answer in time to reply.
+ * Each attempt gets 60% of the time left (the last one gets all of it), so one hanging model cannot starve the fallbacks.
+ * Errors start with "AI request rejected" when nothing failed for a transient reason and at least two models
+ * answered, all of them refusing the input itself (HTTP 400 INVALID_ARGUMENT, e.g. an unreadable image).
+ * Anything else, including missing models, is "AI service unavailable".
  */
 export async function parseWithGemini(
   payload: GeminiPayload,
   apiKey: string,
-  db?: D1Database
+  db?: D1Database,
+  timeoutMs: number = GEMINI_TIMEOUT_MS
 ): Promise<ExpenseData> {
   if (!apiKey || !apiKey.trim()) {
     return { error: "Missing GEMINI_API_KEY" };
@@ -155,10 +162,24 @@ export async function parseWithGemini(
     return { error: "Invalid payload provided" };
   }
 
+  const deadline = Date.now() + timeoutMs;
   const modelSequence = await resolveGeminiModelSequence(db);
   let lastError = "";
+  let rejectionError = "";
+  let rejections = 0;
+  // Models that answered at all (anything but 404), so a misconfigured model list is not blamed on the input.
+  let answered = 0;
+  // Busy, timed out, network error…: retrying later might work, so the input is not to blame.
+  let transientFailure = false;
 
-  for (const model of modelSequence) {
+  for (const [index, model] of modelSequence.entries()) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      lastError = `Timed out after ${timeoutMs} ms${lastError ? ` (${lastError})` : ""}`;
+      transientFailure = true;
+      break;
+    }
+
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
 
@@ -176,18 +197,36 @@ export async function parseWithGemini(
           },
           ...payload,
         }),
+        signal: AbortSignal.timeout(index < modelSequence.length - 1 ? Math.ceil(remainingMs * 0.6) : remainingMs),
       });
 
       const data = (await res.json().catch(() => ({}))) as GeminiApiResponse;
+      if (res.status !== 404) answered++;
 
-      if (res.status === 401 || res.status === 403) {
-        // Credentials problem: other models will fail the same way.
+      const isAccountProblem =
+        res.status === 400 &&
+        (data.error?.status === "FAILED_PRECONDITION" || /api key/i.test(data.error?.message || ""));
+      if (res.status === 401 || res.status === 403 || isAccountProblem) {
+        // Credentials, billing or region problem: other models will fail the same way.
         lastError = data.error?.message || `Access denied (HTTP ${res.status})`;
+        transientFailure = true;
         break;
+      }
+
+      if (res.status === 400) {
+        // The input itself was refused (bad image, too large…); still try the other models in case
+        // only the configured one dislikes the request.
+        lastError = data.error?.message || "Bad request";
+        if (data.error?.status === "INVALID_ARGUMENT") {
+          rejectionError = lastError;
+          rejections++;
+        }
+        continue;
       }
 
       if (res.status === 503 || res.status === 429) {
         lastError = data.error?.message || "Server busy";
+        transientFailure = true;
         continue;
       }
 
@@ -198,17 +237,20 @@ export async function parseWithGemini(
 
       if (!res.ok || data.error) {
         lastError = data.error?.message || `HTTP ${res.status}`;
+        transientFailure = true;
         continue;
       }
 
       const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!rawText) {
+        transientFailure = true;
         continue;
       }
 
       const cleanJson = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
       const parsed: unknown = JSON.parse(cleanJson);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        transientFailure = true;
         continue;
       }
 
@@ -223,8 +265,12 @@ export async function parseWithGemini(
       return expenseData;
     } catch (err: unknown) {
       lastError = err instanceof Error ? err.message : String(err);
+      transientFailure = true;
     }
   }
 
+  if (!transientFailure && answered >= 2 && rejections === answered) {
+    return { error: `AI request rejected: ${rejectionError}` };
+  }
   return { error: `AI service unavailable: ${lastError}` };
 }

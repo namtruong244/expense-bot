@@ -1,20 +1,67 @@
+import {
+  MAX_IMAGE_BYTES,
+  SUPPORTED_IMAGE_MIME_TYPES,
+  TELEGRAM_DOWNLOAD_TIMEOUT_MS,
+  TELEGRAM_PROCESSING_BUDGET_MS,
+} from "../constants";
 import { friendlyParseError, MSG, savedText, transactionKeyboard } from "../messages";
 import { parseWithGemini } from "../services/gemini";
-import { downloadTelegramFileAsBase64, sendChatAction, sendTelegram } from "../services/telegram";
+import { downloadTelegramFileAsBase64, FileTooLargeError, sendChatAction, sendTelegram } from "../services/telegram";
 import { Env, GeminiPayload, TelegramMessage, WebhookUpdate } from "../types";
 import { handleCallbackQuery } from "./callbacks";
 import { handleCommand } from "./commands";
-import { buildTransactions, saveTransaction } from "./record";
+import { buildTransactions, saveTransactions } from "./record";
+
+/**
+ * Message fields holding user content the bot cannot read. Messages with none of these and no
+ * text or image are service updates (joins, pins, title changes…) and are ignored silently.
+ */
+const UNREADABLE_CONTENT_FIELDS = [
+  "sticker",
+  "voice",
+  "audio",
+  "video",
+  "video_note",
+  "animation",
+  "document",
+  "location",
+  "venue",
+  "contact",
+  "poll",
+  "dice",
+  "game",
+  "invoice",
+  "story",
+  "paid_media",
+  "giveaway",
+  "checklist",
+];
+
+interface ImageAttachment {
+  fileId: string;
+  mimeType: string;
+  fileSize?: number;
+}
 
 /** Returns the receipt image attached to a message (photo, or image sent as a file), if any. */
-function getImageAttachment(message: TelegramMessage): { fileId: string; mimeType: string } | null {
+function getImageAttachment(message: TelegramMessage): ImageAttachment | null {
   if (message.photo && message.photo.length > 0) {
-    return { fileId: message.photo[message.photo.length - 1].file_id, mimeType: "image/jpeg" };
+    const largest = message.photo[message.photo.length - 1];
+    return { fileId: largest.file_id, mimeType: "image/jpeg", fileSize: largest.file_size };
   }
-  const doc = message.document;
-  if (doc && doc.mime_type?.startsWith("image/")) {
-    return { fileId: doc.file_id, mimeType: doc.mime_type };
+  // GIFs arrive as `animation` with a copy in `document`; they are not receipts.
+  const doc = "animation" in message ? undefined : message.document;
+  const mimeType = doc?.mime_type?.toLowerCase().replace(/^image\/jpg$/, "image/jpeg");
+  if (doc && mimeType?.startsWith("image/")) {
+    return { fileId: doc.file_id, mimeType, fileSize: doc.file_size };
   }
+  return null;
+}
+
+/** Returns the message explaining why Gemini cannot read this image, or null if it can. */
+function imageProblem(image: ImageAttachment): string | null {
+  if (!SUPPORTED_IMAGE_MIME_TYPES.includes(image.mimeType)) return MSG.imageUnsupported;
+  if (image.fileSize && image.fileSize > MAX_IMAGE_BYTES) return MSG.imageTooLarge;
   return null;
 }
 
@@ -37,6 +84,10 @@ export async function handleTelegramWebhook(
 
   const chatId = message.chat.id;
   const text = message.text ? message.text.trim() : "";
+  const isPrivate = message.chat.type === "private";
+  // Everything below runs in ctx.waitUntil (30 s after the webhook is answered): share one budget
+  // between the photo download and Gemini, leaving time to save and reply.
+  const deadline = Date.now() + TELEGRAM_PROCESSING_BUDGET_MS;
 
   if (!env.DB) {
     await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, MSG.dbMissing);
@@ -51,7 +102,19 @@ export async function handleTelegramWebhook(
   try {
     const image = getImageAttachment(message);
     if (!image && !text) {
-      await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, MSG.unsupported);
+      // Only answer people talking to the bot directly: in groups this would reply to every sticker,
+      // and service updates (joins, pins…) carry no content at all.
+      const hasUnreadableContent = UNREADABLE_CONTENT_FIELDS.some((field) => field in message);
+      if (isPrivate && hasUnreadableContent) {
+        await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, MSG.unsupported);
+      }
+      return;
+    }
+
+    const problem = image && imageProblem(image);
+    if (problem) {
+      // Same rule as above: groups do not get told about every file someone shares.
+      if (isPrivate) await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, problem);
       return;
     }
 
@@ -61,7 +124,12 @@ export async function handleTelegramWebhook(
     let aiPayload: GeminiPayload;
     if (image) {
       try {
-        const base64Image = await downloadTelegramFileAsBase64(image.fileId, env.TELEGRAM_BOT_TOKEN);
+        const base64Image = await downloadTelegramFileAsBase64(
+          image.fileId,
+          env.TELEGRAM_BOT_TOKEN,
+          Math.min(TELEGRAM_DOWNLOAD_TIMEOUT_MS, deadline - Date.now()),
+          MAX_IMAGE_BYTES
+        );
         aiPayload = {
           contents: [
             {
@@ -73,8 +141,13 @@ export async function handleTelegramWebhook(
           ],
         };
       } catch (photoErr: unknown) {
-        console.error("Failed to download Telegram photo:", photoErr);
         await typing;
+        if (photoErr instanceof FileTooLargeError) {
+          // Telegram does not always report file_size up front; same rule as imageProblem: groups stay silent.
+          if (isPrivate) await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, MSG.imageTooLarge);
+          return;
+        }
+        console.error("Failed to download Telegram photo:", photoErr);
         await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, MSG.photoFailed);
         return;
       }
@@ -82,7 +155,10 @@ export async function handleTelegramWebhook(
       aiPayload = { contents: [{ parts: [{ text }] }] };
     }
 
-    const [, expense] = await Promise.all([typing, parseWithGemini(aiPayload, env.GEMINI_API_KEY, env.DB)]);
+    const [, expense] = await Promise.all([
+      typing,
+      parseWithGemini(aiPayload, env.GEMINI_API_KEY, env.DB, deadline - Date.now()),
+    ]);
 
     if (expense.error) {
       console.error("Gemini parse error:", expense.error);
@@ -96,15 +172,17 @@ export async function handleTelegramWebhook(
       return;
     }
 
-    for (const tx of transactions) {
-      let id: number;
-      try {
-        id = await saveTransaction(env.DB, chatId.toString(), tx);
-      } catch (dbErr: unknown) {
-        console.error("Failed to insert expense into D1:", dbErr);
-        await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, MSG.saveFailed);
-        return;
-      }
+    let ids: number[];
+    try {
+      ids = await saveTransactions(env.DB, chatId.toString(), transactions);
+    } catch (dbErr: unknown) {
+      // The batch is one transaction, so nothing was stored and resending is safe.
+      console.error("Failed to insert expenses into D1:", dbErr);
+      await sendTelegram(env.TELEGRAM_BOT_TOKEN, chatId, MSG.saveFailed);
+      return;
+    }
+    for (const [i, tx] of transactions.entries()) {
+      const id = ids[i] ?? 0;
       await sendTelegram(
         env.TELEGRAM_BOT_TOKEN,
         chatId,

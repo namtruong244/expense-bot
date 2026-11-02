@@ -1,3 +1,4 @@
+import { TELEGRAM_DOWNLOAD_TIMEOUT_MS } from "../constants";
 import { stripHtml } from "../formatters";
 import { InlineKeyboard, TelegramGetFileResponse } from "../types";
 
@@ -134,6 +135,14 @@ export async function setTelegramCommands(
   await callTelegram(token, "setMyCommands", { commands });
 }
 
+/** The file is bigger than the caller allows, so it was not (fully) downloaded. */
+export class FileTooLargeError extends Error {
+  constructor(maxBytes: number) {
+    super(`File is larger than ${maxBytes} bytes`);
+    this.name = "FileTooLargeError";
+  }
+}
+
 /**
  * Downloads a photo attachment from Telegram CDN and converts it to a Base64 string for Gemini Vision.
  *
@@ -143,17 +152,25 @@ export async function setTelegramCommands(
  *
  * @param fileId Telegram file identifier.
  * @param token Telegram Bot Token.
+ * @param timeoutMs Budget for both requests together.
+ * @param maxBytes Largest file to accept; throws FileTooLargeError before fetching the body when getFile
+ *   already reports a bigger size, and again if the downloaded body turns out bigger.
  * @returns Base64 encoded string of the image.
  */
 export async function downloadTelegramFileAsBase64(
   fileId: string,
-  token: string
+  token: string,
+  timeoutMs: number = TELEGRAM_DOWNLOAD_TIMEOUT_MS,
+  maxBytes?: number
 ): Promise<string> {
   if (!fileId || !token) {
     throw new Error("Missing fileId or token");
   }
 
-  const metaRes = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`);
+  const signal = AbortSignal.timeout(timeoutMs);
+  const metaRes = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`, {
+    signal,
+  });
   if (!metaRes.ok) {
     throw new Error(`Failed to get file metadata: HTTP ${metaRes.status}`);
   }
@@ -165,12 +182,20 @@ export async function downloadTelegramFileAsBase64(
     throw new Error("Failed to get file path from Telegram");
   }
 
-  const fileRes = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+  const reportedSize = metaData.result?.file_size;
+  if (maxBytes !== undefined && typeof reportedSize === "number" && reportedSize > maxBytes) {
+    throw new FileTooLargeError(maxBytes);
+  }
+
+  const fileRes = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`, { signal });
   if (!fileRes.ok) {
     throw new Error(`Failed to download file from Telegram CDN: HTTP ${fileRes.status}`);
   }
 
   const buffer = await fileRes.arrayBuffer();
+  if (maxBytes !== undefined && buffer.byteLength > maxBytes) {
+    throw new FileTooLargeError(maxBytes);
+  }
   const bytes = new Uint8Array(buffer);
 
   let binary = "";

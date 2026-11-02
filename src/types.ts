@@ -10,8 +10,12 @@ export interface Env {
   GEMINI_API_KEY: string;
   /** Telegram chat ID allowed to change the global Gemini model (/model). If unset, changes are disabled. */
   ADMIN_CHAT_ID?: string;
-  /** User ID that Apple Shortcut requests are stored under when they send no user_id. Defaults to ADMIN_CHAT_ID. */
+  /** User ID that authenticated Apple Shortcut requests are stored under when they send no user_id. Defaults to ADMIN_CHAT_ID. */
   SHORTCUT_USER_ID?: string;
+  /** Secret Apple Shortcuts must send as `Authorization: Bearer <secret>`. Required for the SHORTCUT_USER_ID / ADMIN_CHAT_ID fallback. */
+  SHORTCUT_SECRET?: string;
+  /** `secret_token` given to Telegram's setWebhook; when set, updates without the matching header are rejected. */
+  TELEGRAM_WEBHOOK_SECRET?: string;
 }
 
 /** Transaction classification: regular expense or refund/cancellation */
@@ -130,6 +134,8 @@ export interface GeminiApiResponse {
   error?: {
     message?: string;
     code?: number;
+    /** gRPC-style status, e.g. "INVALID_ARGUMENT" or "FAILED_PRECONDITION" */
+    status?: string;
   };
 }
 
@@ -160,6 +166,7 @@ export interface TelegramGetFileResponse {
   result?: {
     file_id?: string;
     file_path?: string;
+    file_size?: number;
   };
 }
 

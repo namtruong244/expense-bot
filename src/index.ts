@@ -11,12 +11,14 @@
  * - Store and query records in Cloudflare D1 database.
  */
 
+import { isTelegramRequestAuthorized } from "./auth";
 import { handleShortcut } from "./handlers/shortcut";
 import { handleTelegramWebhook } from "./handlers/telegram";
 import { claimTelegramUpdate } from "./services/db";
 import { Env, WebhookUpdate } from "./types";
 
 export * from "./types";
+export * from "./auth";
 export * from "./constants";
 export * from "./formatters";
 export * from "./messages";
@@ -36,6 +38,7 @@ export default {
    * @param request Incoming HTTP request.
    * @param env Worker environment bindings and secrets.
    * @param ctx Execution context; Telegram updates are processed after replying so slow AI calls never time out the webhook.
+   *   That work only gets 30 seconds, so downloads and Gemini calls run on time budgets that leave room to reply.
    */
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     if (!env) {
@@ -50,7 +53,11 @@ export default {
       const update = (rawUpdate && typeof rawUpdate === "object" ? rawUpdate : {}) as WebhookUpdate;
 
       if (update.source === "shortcut") {
-        return await handleShortcut(update, env);
+        return await handleShortcut(update, env, request.headers);
+      }
+
+      if (!isTelegramRequestAuthorized(request.headers, env.TELEGRAM_WEBHOOK_SECRET)) {
+        return new Response("Unauthorized", { status: 401 });
       }
 
       // Telegram re-sends an update it believes failed; skip ones already claimed.
