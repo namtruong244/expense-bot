@@ -145,10 +145,15 @@ function normalizeAmount(data: ExpenseData): void {
  * Dynamically resolves model sequence and automatically falls back if primary models are busy or deprecated.
  * All attempts share one `timeoutMs` budget so the caller always gets an answer in time to reply.
  * Each attempt gets 60% of the time left (the last one gets all of it), so one hanging model cannot starve the fallbacks.
- * Errors start with "AI configuration error" for account problems (bad API key, billing, region): retrying never helps.
+ * Errors start with "AI configuration error" for account problems: a missing or invalid API key, billing or region
+ * (HTTP 401, "API key" messages, FAILED_PRECONDITION) stop at once because every model fails the same way. A plain
+ * 403 may concern one model only (e.g. a preview model chosen with /model), so the remaining models are still tried
+ * and it is a configuration error only when every model that answered was denied.
  * They start with "AI request rejected" when nothing failed for a transient reason and every model that answered
- * refused the input itself (HTTP 400 INVALID_ARGUMENT, e.g. an unreadable image), provided at least two answered
- * or the payload has an image (one model's refusal of a picture is enough; text needs a second opinion).
+ * without being denied refused the input itself (HTTP 400 INVALID_ARGUMENT, e.g. an unreadable image; a model that
+ * was denied access says nothing about the input and is not counted), provided at least two such models answered
+ * or the stable FALLBACK_GEMINI_MODEL was one of them. One unknown model refusing is not enough: it may simply be
+ * unable to handle that image or format.
  * Anything else, including missing models, is "AI service unavailable".
  */
 export async function parseWithGemini(
@@ -158,7 +163,7 @@ export async function parseWithGemini(
   timeoutMs: number = GEMINI_TIMEOUT_MS
 ): Promise<ExpenseData> {
   if (!apiKey || !apiKey.trim()) {
-    return { error: "Missing GEMINI_API_KEY" };
+    return { error: "AI configuration error: Missing GEMINI_API_KEY" };
   }
   if (!payload || !Array.isArray(payload.contents) || payload.contents.length === 0) {
     return { error: "Invalid payload provided" };
@@ -169,11 +174,15 @@ export async function parseWithGemini(
   let lastError = "";
   let rejectionError = "";
   let rejections = 0;
+  // The stable fallback model refused the input: a conclusive verdict even when no other model answered.
+  let fallbackRejected = false;
+  // Models that denied access (403) without the key itself being at fault.
+  let denials = 0;
+  let denialError = "";
   // Models that answered at all (anything but 404), so a misconfigured model list is not blamed on the input.
   let answered = 0;
   // Busy, timed out, network error…: retrying later might work, so the input is not to blame.
   let transientFailure = false;
-  const hasImage = payload.contents.some((c) => c.parts?.some((p) => "inline_data" in p));
 
   for (const [index, model] of modelSequence.entries()) {
     const remainingMs = deadline - Date.now();
@@ -206,12 +215,21 @@ export async function parseWithGemini(
       const data = (await res.json().catch(() => ({}))) as GeminiApiResponse;
       if (res.status !== 404) answered++;
 
-      const isAccountProblem =
-        res.status === 400 &&
-        (data.error?.status === "FAILED_PRECONDITION" || /api key/i.test(data.error?.message || ""));
-      if (res.status === 401 || res.status === 403 || isAccountProblem) {
+      const isKeyProblem =
+        res.status === 401 ||
+        ((res.status === 400 || res.status === 403) &&
+          (data.error?.status === "FAILED_PRECONDITION" || /api key/i.test(data.error?.message || "")));
+      if (isKeyProblem) {
         // Credentials, billing or region problem: other models will fail the same way.
         return { error: `AI configuration error: ${data.error?.message || `Access denied (HTTP ${res.status})`}` };
+      }
+
+      if (res.status === 403) {
+        // May only concern this model (e.g. a preview model): try the others before blaming the configuration.
+        denialError = data.error?.message || "Access denied (HTTP 403)";
+        lastError = denialError;
+        denials++;
+        continue;
       }
 
       if (res.status === 400) {
@@ -221,6 +239,7 @@ export async function parseWithGemini(
         if (data.error?.status === "INVALID_ARGUMENT") {
           rejectionError = lastError;
           rejections++;
+          if (model === FALLBACK_GEMINI_MODEL) fallbackRejected = true;
         }
         continue;
       }
@@ -270,7 +289,11 @@ export async function parseWithGemini(
     }
   }
 
-  if (!transientFailure && (answered >= 2 || (hasImage && answered >= 1)) && rejections === answered) {
+  if (!transientFailure && denials > 0 && denials === answered) {
+    return { error: `AI configuration error: ${denialError}` };
+  }
+  // Denied models carry no verdict on the input, so "every model refused it" is judged among the others.
+  if (!transientFailure && (answered - denials >= 2 || fallbackRejected) && rejections > 0 && rejections === answered - denials) {
     return { error: `AI request rejected: ${rejectionError}` };
   }
   return { error: `AI service unavailable: ${lastError}` };

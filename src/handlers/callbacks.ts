@@ -22,7 +22,7 @@ import {
   sendTelegram,
 } from "../services/telegram";
 import { Env, ExpenseRow, TelegramCallbackQuery } from "../types";
-import { confirmedPayAllMaxId, payAllPrompt, payBills, sendPayAllConfirm } from "./commands";
+import { confirmedPayAllIds, payAllPrompt, payBills, sendPayAllConfirm } from "./commands";
 
 /**
  * Handles inline keyboard button presses. Callback data format:
@@ -33,7 +33,9 @@ import { confirmedPayAllMaxId, payAllPrompt, payBills, sendPayAllConfirm } from 
  *   card:<id>           toggle cash <-> credit card (not for bills already paid)
  *   pay:<id>            pay one credit card bill
  *   payall              ask to confirm paying every bill (see /pay all)
- *   payallok:<maxId>:<hash>  pay the bills the prompt showed (hash = checksum of the shown bill IDs)
+ *   payallok:<maxId>:<hash>  pay the bills the prompt showed (highest bill ID + checksum of the shown bill IDs);
+ *                       exactly the IDs that passed the check are paid, so nothing is ever paid unseen; bills
+ *                       newer than maxId are left unpaid
  *   cancel              dismiss a confirmation
  * Every query is scoped to the chat that pressed the button.
  */
@@ -72,14 +74,14 @@ export async function handleCallbackQuery(query: TelegramCallbackQuery, env: Env
         await editTelegramMessage(token, chatId, messageId, MSG.noDebtToPay);
         return;
       }
-      const maxId = confirmedPayAllMaxId(unpaid, args);
-      if (maxId === null) {
-        // Bills changed since the prompt (or it predates this check): ask again with the current list.
+      const billIds = confirmedPayAllIds(unpaid, args);
+      if (billIds === null) {
+        // A bill the prompt showed changed since (or the prompt predates this check): ask again with the current list.
         const prompt = payAllPrompt(unpaid);
         await editTelegramMessage(token, chatId, messageId, `${MSG.payAllChanged}\n\n${prompt.text}`, prompt.keyboard);
         return;
       }
-      const text = await payBills(env.DB, userId, { upToId: maxId });
+      const text = await payBills(env.DB, userId, billIds);
       await editTelegramMessage(token, chatId, messageId, text ?? MSG.noDebtToPay);
       return;
     }

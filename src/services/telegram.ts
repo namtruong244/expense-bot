@@ -6,7 +6,8 @@ const API_BASE = "https://api.telegram.org";
 
 /**
  * Calls a Telegram Bot API method with a JSON body. Never throws: network errors and timeouts
- * (TELEGRAM_API_TIMEOUT_MS) are logged. Returns the HTTP response (or null on network failure or timeout) so callers can inspect failures.
+ * (`timeoutMs`, at most TELEGRAM_API_TIMEOUT_MS by default) are logged. Returns the HTTP response (or null on network
+ * failure or timeout) so callers can inspect failures. A `timeoutMs` of zero or less (no time left) makes no request.
  */
 export async function callTelegram(
   token: string,
@@ -14,6 +15,10 @@ export async function callTelegram(
   body: Record<string, unknown>,
   timeoutMs: number = TELEGRAM_API_TIMEOUT_MS
 ): Promise<Response | null> {
+  if (timeoutMs <= 0) {
+    console.error(`Telegram ${method} skipped: out of time`);
+    return null;
+  }
   try {
     return await fetch(`${API_BASE}/bot${token}/${method}`, {
       method: "POST",
@@ -25,6 +30,11 @@ export async function callTelegram(
     console.error(`Telegram ${method} failed:`, err);
     return null;
   }
+}
+
+/** Per-call timeout: TELEGRAM_API_TIMEOUT_MS, cut to the time left before `deadline` (epoch ms) when there is one. */
+function callTimeout(deadline?: number): number {
+  return deadline === undefined ? TELEGRAM_API_TIMEOUT_MS : Math.min(TELEGRAM_API_TIMEOUT_MS, deadline - Date.now());
 }
 
 /** True when Telegram rejected the request because the HTML could not be parsed. */
@@ -47,31 +57,44 @@ async function isParseError(res: Response | null): Promise<boolean> {
  * @param chatId Destination chat identifier.
  * @param text HTML formatted message body.
  * @param replyMarkup Optional inline keyboard shown under the message.
+ * @param deadline Optional epoch ms by which the send, including its plain-text retry, must be over; calls are
+ *   cut to the time left, or skipped when none is.
  */
 export async function sendTelegram(
   token: string,
   chatId: number,
   text: string,
-  replyMarkup?: InlineKeyboard
+  replyMarkup?: InlineKeyboard,
+  deadline?: number
 ): Promise<void> {
   if (!token || !token.trim() || !chatId || !text) {
     return;
   }
 
-  const res = await callTelegram(token, "sendMessage", {
-    chat_id: chatId,
-    text,
-    parse_mode: "HTML",
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-  });
+  const res = await callTelegram(
+    token,
+    "sendMessage",
+    {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    },
+    callTimeout(deadline)
+  );
 
   // Fallback: if HTML parsing fails, retry as plain text so the user still gets the message
   if (await isParseError(res)) {
-    await callTelegram(token, "sendMessage", {
-      chat_id: chatId,
-      text: stripHtml(text),
-      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-    });
+    await callTelegram(
+      token,
+      "sendMessage",
+      {
+        chat_id: chatId,
+        text: stripHtml(text),
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      },
+      callTimeout(deadline)
+    );
   }
 }
 
@@ -131,10 +154,10 @@ export async function answerCallbackQuery(token: string, callbackQueryId: string
   });
 }
 
-/** Shows the "typing…" indicator so the user knows the bot is working. */
-export async function sendChatAction(token: string, chatId: number, action = "typing"): Promise<void> {
+/** Shows the "typing…" indicator so the user knows the bot is working (cut to the time left before `deadline`, if given). */
+export async function sendChatAction(token: string, chatId: number, action = "typing", deadline?: number): Promise<void> {
   if (!token || !chatId) return;
-  await callTelegram(token, "sendChatAction", { chat_id: chatId, action });
+  await callTelegram(token, "sendChatAction", { chat_id: chatId, action }, callTimeout(deadline));
 }
 
 /** Registers the command list shown in Telegram's "/" menu. */

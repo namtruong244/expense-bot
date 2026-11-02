@@ -39,6 +39,14 @@ import worker, {
   FileTooLargeError,
   callTelegram,
   MAX_PAY_IDS,
+  TELEGRAM_TOTAL_BUDGET_MS,
+  TELEGRAM_PROCESSING_BUDGET_MS,
+  TELEGRAM_MIN_REPLY_MS,
+  sendChatAction,
+  MSG,
+  friendlyParseError,
+  confirmedPayAllIds,
+  describeRow,
 } from "../src/index";
 
 interface ExecutedStatement {
@@ -255,23 +263,36 @@ describe("Expense Bot Suite", () => {
   describe("payCreditCardExpenses batching", () => {
     const row = { id: 5, amount: 1000, description: "x" };
 
-    it("selects and updates in one batch, binding each distinct ID once", async () => {
+    it("selects and updates in one batch, binding the IDs in ascending order", async () => {
       const batchSpy = vi.fn();
       const { db, statements } = createMockD1({ allResults: [row] });
       const spied = { ...db, batch: (stmts: D1PreparedStatement[]) => (batchSpy(stmts.length), db.batch(stmts)) } as D1Database;
 
-      const paid = await payCreditCardExpenses(spied, "user_1", [5, 5, 7, 5, 7]);
+      const paid = await payCreditCardExpenses(spied, "user_1", [7, 5]);
       expect(paid).toHaveLength(1);
       expect(batchSpy.mock.calls).toEqual([[2]]);
       expect(statements.map((st) => st.sql.trim().split(" ")[0])).toEqual(["SELECT", "UPDATE"]);
       expect(statements[0].bindings).toEqual(["user_1", 5, 7]);
       expect(statements[1].bindings).toEqual(["user_1", 5, 7]);
+      // Only unpaid credit card bills of that user can be settled.
+      for (const st of statements) expect(st.sql).toContain("payment_method = 'credit_card' AND is_paid = 0");
     });
 
-    it("runs no query for more than MAX_PAY_IDS distinct IDs", async () => {
+    it("settles any number of IDs in one batch, binding at most 100 parameters per statement", async () => {
+      const batchSpy = vi.fn();
       const { db, statements } = createMockD1({ allResults: [row] });
-      const ids = Array.from({ length: MAX_PAY_IDS + 1 }, (_, i) => i + 1);
-      expect(await payCreditCardExpenses(db, "user_1", ids)).toEqual([]);
+      const spied = { ...db, batch: (stmts: D1PreparedStatement[]) => (batchSpy(stmts.length), db.batch(stmts)) } as D1Database;
+      const ids = Array.from({ length: 200 }, (_, i) => i + 1);
+
+      await payCreditCardExpenses(spied, "user_1", ids);
+      expect(batchSpy.mock.calls).toEqual([[6]]); // 3 chunks of (SELECT, UPDATE), still one transaction
+      expect(Math.max(...statements.map((st) => st.bindings.length))).toBeLessThanOrEqual(100);
+      expect(statements.flatMap((st) => (st.sql.startsWith("UPDATE") ? st.bindings.slice(1) : []))).toEqual(ids);
+    });
+
+    it("runs no query for IDs that are not positive integers", async () => {
+      const { db, statements } = createMockD1({ allResults: [row] });
+      expect(await payCreditCardExpenses(db, "user_1", [0, -1, 1.5, NaN])).toEqual([]);
       expect(statements).toHaveLength(0);
     });
   });
@@ -336,6 +357,52 @@ describe("Expense Bot Suite", () => {
       await sendTelegram("token", 12345, "");
 
       expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("makes no call once its deadline has passed", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
+      globalThis.fetch = fetchMock;
+      await sendTelegram("tok", 1, "hi", undefined, Date.now() - 1);
+      expect(fetchMock).not.toHaveBeenCalled();
+      await sendTelegram("tok", 1, "hi", undefined, Date.now() + 60_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("sendChatAction is cut to the time left before its deadline, when given one", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const timeout = vi.spyOn(AbortSignal, "timeout");
+      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
+      globalThis.fetch = fetchMock;
+      await sendChatAction("tok", 1);
+      await sendChatAction("tok", 1, "typing", Date.now() + 2_000);
+      expect(timeout.mock.calls.map((c) => c[0])[0]).toBe(5_000);
+      expect(timeout.mock.calls.map((c) => c[0])[1]).toBeLessThanOrEqual(2_000);
+      await sendChatAction("tok", 1, "typing", Date.now() - 1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("cuts the call to the time left before its deadline, and skips the plain-text retry when none is left", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const timeout = vi.spyOn(AbortSignal, "timeout");
+      let now = 1_000_000;
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      const fetchMock = vi.fn(async () => {
+        now += 5_000; // the first attempt runs past the deadline
+        return new Response("Bad Request: can't parse entities", { status: 400 });
+      });
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      await sendTelegram("tok", 1, "<b>hi", undefined, now + 4_500);
+      expect(timeout.mock.calls.map((c) => c[0])).toEqual([4_500]); // under the 5 s per-call limit
+      expect(fetchMock).toHaveBeenCalledTimes(1); // no time for the retry
+
+      // With time to spare the retry goes ahead, again limited to what is left.
+      fetchMock.mockClear();
+      timeout.mockClear();
+      await sendTelegram("tok", 1, "<b>hi", undefined, now + 12_000);
+      expect(timeout.mock.calls.map((c) => c[0])).toEqual([5_000, 5_000]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
     it("retries as plain text if Telegram returns 400 parse error", async () => {
@@ -494,7 +561,7 @@ describe("Expense Bot Suite", () => {
 
     it("returns error when GEMINI_API_KEY is empty", async () => {
       const result = await parseWithGemini(dummyPayload, "");
-      expect(result).toEqual({ error: "Missing GEMINI_API_KEY" });
+      expect(result).toEqual({ error: "AI configuration error: Missing GEMINI_API_KEY" });
     });
 
     it("successfully parses valid response from gemini-3.1-flash", async () => {
@@ -718,27 +785,87 @@ describe("Expense Bot Suite", () => {
       expect(result.error).toMatch(/^AI configuration error: API key not valid/);
     });
 
-    it("reports 401/403 as a configuration error after one call", async () => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { message: "Permission denied" } }), { status: 403 }));
-      globalThis.fetch = fetchMock;
-      expect(await parseWithGemini(dummyPayload, "key_gemini")).toEqual({ error: "AI configuration error: Permission denied" });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+    it("maps a missing API key to the configuration-error message", () => {
+      expect(friendlyParseError("AI configuration error: Missing GEMINI_API_KEY")).toBe(MSG.aiConfigError);
     });
 
-    it("accepts one model's refusal of an image, but wants a second opinion on text", async () => {
+    it("reports 401 and 403 'API key' denials as a configuration error after one call", async () => {
+      for (const [status, message] of [
+        [401, "Request had invalid authentication credentials."],
+        [403, "Your API key was reported as leaked."],
+      ] as const) {
+        const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { message } }), { status }));
+        globalThis.fetch = fetchMock;
+        expect(await parseWithGemini(dummyPayload, "key_gemini")).toEqual({ error: `AI configuration error: ${message}` });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      }
+    });
+
+    it("tries the next model when a 403 may be specific to one model", async () => {
+      const denied = () => new Response(JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "Permission denied" } }), { status: 403 });
+      const db = createMockD1({ allResults: [{ key: "gemini_active_model", value: "gemini-preview-x" }] }).db;
+      const ok = new Response(
+        JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ transactions: [{ amount: 45000 }] }) }] } }] }),
+        { status: 200 }
+      );
+      const fetchMock = vi.fn().mockResolvedValueOnce(denied()).mockResolvedValueOnce(ok);
+      globalThis.fetch = fetchMock;
+      const result = await parseWithGemini(dummyPayload, "key_gemini", db);
+      expect(result.transactions?.[0].amount).toBe(45000);
+      expect(String(fetchMock.mock.calls[0][0])).toContain("gemini-preview-x");
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("reports a configuration error only when every model that answered denied access", async () => {
+      const denied = () => new Response(JSON.stringify({ error: { message: "Permission denied" } }), { status: 403 });
+      const fetchMock = vi.fn().mockImplementation(async () => denied());
+      globalThis.fetch = fetchMock;
+      expect(await parseWithGemini(dummyPayload, "key_gemini")).toEqual({ error: "AI configuration error: Permission denied" });
+      expect(fetchMock).toHaveBeenCalledTimes(2); // default + fallback
+
+      // A denied model plus an overloaded one is not conclusive.
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValueOnce(denied())
+        .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "busy" } }), { status: 503 }));
+      expect((await parseWithGemini(dummyPayload, "key_gemini")).error).toMatch(/^AI service unavailable/);
+    });
+
+    it("blames the input only with a second opinion or from the stable fallback model", async () => {
       const refused = () => new Response(JSON.stringify({ error: { status: "INVALID_ARGUMENT", message: "bad image" } }), { status: 400 });
-      const sequence = () =>
-        vi.fn().mockResolvedValueOnce(refused()).mockResolvedValueOnce(new Response("{}", { status: 404 })).mockResolvedValueOnce(new Response("{}", { status: 404 }));
-      const db = createMockD1({ allResults: [{ key: "gemini_active_model", value: "gemini-x" }] }).db;
+      const missing = () => new Response("{}", { status: 404 });
       const imagePayload: GeminiPayload = {
         contents: [{ parts: [{ text: "receipt" }, { inline_data: { mime_type: "image/jpeg", data: "AAAA" } }] }],
       };
+      const db = createMockD1({ allResults: [{ key: "gemini_active_model", value: "gemini-x" }] }).db;
 
-      globalThis.fetch = sequence();
+      // Only an unknown model refused (the others are stale/missing): even for an image that is not conclusive.
+      globalThis.fetch = vi.fn().mockResolvedValueOnce(refused()).mockResolvedValueOnce(missing()).mockResolvedValueOnce(missing());
+      expect((await parseWithGemini(imagePayload, "key_gemini", db)).error).toMatch(/^AI service unavailable/);
+
+      // The stable fallback model refused while the rest are missing: conclusive.
+      globalThis.fetch = vi.fn().mockResolvedValueOnce(missing()).mockResolvedValueOnce(missing()).mockResolvedValueOnce(refused());
       expect((await parseWithGemini(imagePayload, "key_gemini", db)).error).toBe("AI request rejected: bad image");
 
-      globalThis.fetch = sequence();
+      // Two models refused: conclusive.
+      globalThis.fetch = vi.fn().mockResolvedValueOnce(refused()).mockResolvedValueOnce(refused()).mockResolvedValueOnce(missing());
+      expect((await parseWithGemini(imagePayload, "key_gemini", db)).error).toBe("AI request rejected: bad image");
+    });
+
+    it("judges the input only by the models that were not denied access", async () => {
+      const denied = () => new Response(JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "Permission denied" } }), { status: 403 });
+      const refused = () => new Response(JSON.stringify({ error: { status: "INVALID_ARGUMENT", message: "bad image" } }), { status: 400 });
+      const db = createMockD1({ allResults: [{ key: "gemini_active_model", value: "gemini-preview-x" }] }).db;
+
+      // The chosen model is denied, the default and fallback both refuse the image: still the input's fault.
+      globalThis.fetch = vi.fn().mockResolvedValueOnce(denied()).mockResolvedValueOnce(refused()).mockResolvedValueOnce(refused());
+      expect((await parseWithGemini(dummyPayload, "key_gemini", db)).error).toBe("AI request rejected: bad image");
+
+      // One refusal among denials is no second opinion, unless it came from the stable fallback model.
+      globalThis.fetch = vi.fn().mockResolvedValueOnce(denied()).mockResolvedValueOnce(refused()).mockResolvedValueOnce(denied());
       expect((await parseWithGemini(dummyPayload, "key_gemini", db)).error).toMatch(/^AI service unavailable/);
+      globalThis.fetch = vi.fn().mockResolvedValueOnce(denied()).mockResolvedValueOnce(denied()).mockResolvedValueOnce(refused());
+      expect((await parseWithGemini(dummyPayload, "key_gemini", db)).error).toBe("AI request rejected: bad image");
     });
 
     it("gives up when the time budget runs out instead of hanging", async () => {
@@ -809,7 +936,7 @@ describe("Expense Bot Suite", () => {
 
     it("returns error if apiKey is whitespace", async () => {
       const result = await parseWithGemini(dummyPayload, "   ");
-      expect(result).toEqual({ error: "Missing GEMINI_API_KEY" });
+      expect(result).toEqual({ error: "AI configuration error: Missing GEMINI_API_KEY" });
     });
 
     it("returns error if payload contents is empty", async () => {
@@ -1132,7 +1259,7 @@ describe("Expense Bot Suite", () => {
             },
             async run() {
               const result = await stmt.run();
-              const isNew = sql.includes("INSERT OR IGNORE") && !seen.has(bound[0]);
+              const isNew = sql.includes("INSERT INTO telegram_updates") && !seen.has(bound[0]);
               if (isNew) seen.add(bound[0]);
               return { ...result, meta: { ...result.meta, changes: isNew ? 1 : 0 } };
             },
@@ -1141,28 +1268,40 @@ describe("Expense Bot Suite", () => {
       } as D1Database;
 
       expect(await claimTelegramUpdate(claimingDb, 101)).toBe(true);
-      expect(await claimTelegramUpdate(claimingDb, 100)).toBe(true);
+      expect(await claimTelegramUpdate(claimingDb, 99)).toBe(true);
       expect(await claimTelegramUpdate(claimingDb, 101)).toBe(false);
       expect(await claimTelegramUpdate(claimingDb, 5)).toBe(true);
-      // Each claim is a prune followed by the insert, and nothing else.
-      expect(statements.slice(0, 2).map((st) => st.sql.split(" ").slice(0, 2).join(" "))).toEqual(["DELETE FROM", "INSERT OR"]);
-      expect(statements).toHaveLength(8);
+      // Each of these claims is just the insert (no prune: none of the IDs is a multiple of 100).
+      expect(statements.map((st) => st.sql.split(" ").slice(0, 2).join(" "))).toEqual(Array(4).fill("INSERT INTO"));
     });
 
-    it("claimTelegramUpdate prunes on every claim in the same single two-statement batch, without DDL", async () => {
+    it("claimTelegramUpdate is a single insert in one batch, pruning only on every 100th update ID", async () => {
       const batchSpy = vi.fn();
-      const { db, statements } = createMockD1({ runMeta: { changes: 1 } });
-      const spied = { ...db, batch: (stmts: D1PreparedStatement[]) => (batchSpy(stmts.length), db.batch(stmts)) } as D1Database;
+      const run = async (updateId: number, changes = 1) => {
+        const { db, statements } = createMockD1({ runMeta: { changes } });
+        const spied = { ...db, batch: (stmts: D1PreparedStatement[]) => (batchSpy(stmts.length), db.batch(stmts)) } as D1Database;
+        const claimed = await claimTelegramUpdate(spied, updateId);
+        return { claimed, statements };
+      };
 
-      expect(await claimTelegramUpdate(spied, 201)).toBe(true);
-      expect(statements.map((st) => st.sql.split(" ").slice(0, 2).join(" "))).toEqual(["DELETE FROM", "INSERT OR"]);
-      expect(statements[0].sql).toContain("received_at < datetime('now', '-6 days')");
-      expect(statements[1].bindings).toEqual([201]);
-      expect(batchSpy.mock.calls).toEqual([[2]]);
+      const plain = await run(201);
+      expect(plain.claimed).toBe(true);
+      expect(plain.statements.map((st) => st.sql.split(" ").slice(0, 2).join(" "))).toEqual(["INSERT INTO"]);
+      expect(plain.statements[0].bindings).toEqual([201]);
+      // A row older than six days is refreshed and counts as new (changes > 0), so a reused ID is not dropped as a retry
+      // even when the sampled prune has not removed it yet; a recent row changes nothing (a real retry).
+      expect(plain.statements[0].sql).toContain("ON CONFLICT(update_id) DO UPDATE SET received_at = CURRENT_TIMESTAMP");
+      expect(plain.statements[0].sql).toContain("WHERE telegram_updates.received_at < datetime('now', '-6 days')");
 
-      // The claim is read from the INSERT.
-      const dup = createMockD1({ runMeta: { changes: 0 } });
-      expect(await claimTelegramUpdate(dup.db, 300)).toBe(false);
+      const sampled = await run(300);
+      expect(sampled.statements.map((st) => st.sql.split(" ").slice(0, 2).join(" "))).toEqual(["DELETE FROM", "INSERT INTO"]);
+      expect(sampled.statements[0].sql).toContain("received_at < datetime('now', '-6 days')");
+      expect(sampled.statements[1].bindings).toEqual([300]);
+      expect(batchSpy.mock.calls).toEqual([[1], [2]]);
+
+      // The claim is read from the INSERT, with or without the prune.
+      expect((await run(301, 0)).claimed).toBe(false);
+      expect((await run(300, 0)).claimed).toBe(false);
     });
 
     it("claimTelegramUpdate creates the table and index on 'no such table', then claims", async () => {
@@ -1170,18 +1309,17 @@ describe("Expense Bot Suite", () => {
         runMeta: { changes: 1 },
         onExecute: (st) => {
           const created = statements.some((x) => x.sql.startsWith("CREATE TABLE"));
-          if (!created && st.sql.startsWith("DELETE FROM telegram_updates")) {
+          if (!created && st.sql.startsWith("INSERT INTO telegram_updates")) {
             throw new Error("D1_ERROR: no such table: telegram_updates: SQLITE_ERROR");
           }
         },
       });
       expect(await claimTelegramUpdate(db, 7)).toBe(true);
       expect(statements.map((st) => st.sql.split(" ").slice(0, 3).join(" "))).toEqual([
-        "DELETE FROM telegram_updates",
+        "INSERT INTO telegram_updates",
         "CREATE TABLE IF",
         "CREATE INDEX IF",
-        "DELETE FROM telegram_updates",
-        "INSERT OR IGNORE",
+        "INSERT INTO telegram_updates",
       ]);
       expect(statements[2].sql).toContain("idx_telegram_updates_received ON telegram_updates (received_at)");
     });
@@ -1280,6 +1418,20 @@ describe("Expense Bot Suite", () => {
       expect(text).toContain("• 🔴 <b>45.000 ₫</b> · Ăn uống · Phở &lt;bò&gt;");
     });
 
+    it("/today stays under Telegram's 4096 characters however many transactions there are, and still totals them all", async () => {
+      const many = Array.from({ length: 200 }, (_, i) => ({
+        id: i + 1,
+        amount: 1000,
+        category: "Other",
+        description: "<&>".repeat(40),
+        payment_method: "cash",
+      }));
+      const { messages } = await runCommand("/today", createMockD1({ allResults: many }).db);
+      expect(messages[0].text.length).toBeLessThan(4096);
+      expect(messages[0].text).toMatch(/… và \d+ khoản khác/);
+      expect(messages[0].text).toContain("Tổng chi: 200.000 ₫");
+    });
+
     it("/today shows a net surplus when refunds exceed expenses", async () => {
       const { db } = createMockD1({ allResults: [{ id: 1, amount: -50000, category: "Other", description: "Refund" }] });
       const { messages } = await runCommand("/homnay", db);
@@ -1348,6 +1500,21 @@ describe("Expense Bot Suite", () => {
       expect((await runCommand("/recent", createMockD1().db)).messages[0].text).toContain("Chưa có giao dịch");
     });
 
+    it("/recent stays under Telegram's 4096 characters with long, escape-heavy descriptions", async () => {
+      const rows = Array.from({ length: 10 }, (_, i) => ({
+        id: i + 1,
+        amount: 1000,
+        category: "Other",
+        description: "<&>".repeat(500),
+        payment_method: "cash",
+        created_at: "2026-10-25 03:00:00",
+      }));
+      const { messages } = await runCommand("/recent", createMockD1({ allResults: rows }).db);
+      expect(messages[0].text.length).toBeLessThan(4096);
+      expect(messages[0].text).toMatch(/… và \d+ khoản khác/);
+      expect(messages[0].text).toContain("/delete");
+    });
+
     it("/delete asks for confirmation instead of deleting immediately", async () => {
       const { db, statements } = createMockD1({
         firstResult: { id: 5, amount: 45000, category: "Food & Dining", description: "Phở", payment_method: "cash" },
@@ -1393,6 +1560,53 @@ describe("Expense Bot Suite", () => {
       expect(messages[0].text).not.toContain("#26</b>");
       expect(messages[0].text).toContain("… và 75 khoản khác");
       expect(buttons(messages[0]).at(-1)).toBe("payall");
+    });
+
+    it("/debt stays under Telegram's 4096 characters with huge, escape-heavy descriptions", async () => {
+      const nasty = "<&>".repeat(5_000);
+      const bills = Array.from({ length: 25 }, (_, i) => ({ id: i + 1, amount: 1000, category: "Other", description: nasty }));
+      const { messages } = await runCommand("/debt", createMockD1({ allResults: bills }).db);
+      expect(messages[0].text.length).toBeLessThan(4096);
+      expect(messages[0].text).toMatch(/… và \d+ khoản khác/);
+      expect(messages[0].text).toContain("Tổng nợ: 25.000 ₫");
+      expect(messages[0].text).toContain("/pay all");
+
+      // Long descriptions are cut on a character boundary, never inside an escaped entity.
+      const row = describeRow({ id: 1, amount: 1000, category: "Other", description: "&".repeat(200) } as ExpenseRow);
+      expect(row).toContain(`${"&amp;".repeat(80)}…`);
+    });
+
+    it("cuts long descriptions between grapheme clusters, in NFC", () => {
+      const describe1 = (description: string) => describeRow({ id: 1, amount: 1000, category: "Other", description } as ExpenseRow);
+
+      // NFD Vietnamese (base letter + combining tone marks): the cut must not strip a mark off the last letter.
+      const nfd = "Phở bò tái nạm gầu ".normalize("NFD").repeat(6);
+      const cutNfd = describe1(nfd).split(" · ").pop()!;
+      expect(cutNfd.endsWith("…")).toBe(true);
+      expect(cutNfd).toBe(cutNfd.normalize("NFC"));
+      expect(Array.from(cutNfd.slice(0, -1).normalize("NFC")).length).toBe(80);
+      expect(cutNfd).not.toMatch(/\p{M}…$/u);
+
+      // A ZWJ family emoji straddling the boundary stays whole (or is dropped), never split into its parts.
+      const family = "👨‍👩‍👧";
+      const cutEmoji = describe1(`${"a".repeat(79)}${family}${"b".repeat(10)}`).split(" · ").pop()!;
+      expect(cutEmoji).toBe(`${"a".repeat(79)}${family}…`);
+      expect(cutEmoji).not.toContain("\u200d…");
+
+      // Short text is kept (NFC-normalised) without an ellipsis.
+      expect(describe1("Phở".normalize("NFD"))).toContain("· Phở");
+      expect(describe1("Phở".normalize("NFD"))).not.toContain("…");
+    });
+
+    it("falls back to code points when Intl.Segmenter is unavailable", () => {
+      const original = Object.getOwnPropertyDescriptor(Intl, "Segmenter")!;
+      Object.defineProperty(Intl, "Segmenter", { value: undefined, configurable: true, writable: true });
+      try {
+        const row = describeRow({ id: 1, amount: 1000, category: "Other", description: "😀".repeat(100) } as ExpenseRow);
+        expect(row).toContain(`${"😀".repeat(80)}…`);
+      } finally {
+        Object.defineProperty(Intl, "Segmenter", original);
+      }
     });
 
     it("/debt omits 'pay all' for a single bill and reports when there is no debt", async () => {
@@ -1457,6 +1671,15 @@ describe("Expense Bot Suite", () => {
       expect(messages[0].text).toContain("Cài đặt model Gemini AI");
       expect(messages[0].text).toContain("Model đang dùng:");
       expect(messages[0].text).toContain("/model auto");
+    });
+
+    it("/model lists a capped number of models so the message fits Telegram's limit", async () => {
+      const models = Array.from({ length: 150 }, (_, i) => `gemini-${i}-${"x".repeat(50)}`);
+      const { db } = createMockD1({ allResults: [{ key: "gemini_discovered_models", value: JSON.stringify(models) }] });
+      const { messages } = await runCommand("/model", db);
+      expect(messages[0].text.length).toBeLessThan(4096);
+      expect(messages[0].text).toMatch(/… và \d+ khoản khác/);
+      expect(messages[0].text).toContain("/model reset");
     });
 
     it("/model auto synchronizes models from Google", async () => {
@@ -1651,7 +1874,7 @@ describe("Expense Bot Suite", () => {
       const ok = await press(`payallok:5:${hashOf([5])}`, bills);
       expect(String(find(ok.calls, "editMessageText")?.text)).toContain("Đã ghi nhận thanh toán");
       const upd = ok.statements.find((st) => st.sql.includes("UPDATE expenses"));
-      expect(upd?.sql).toContain("id <= ?");
+      expect(upd?.sql).toContain("id IN (?)");
       expect(upd?.bindings).toEqual(["1111", 5]);
 
       const cancel = await press("cancel");
@@ -1662,11 +1885,18 @@ describe("Expense Bot Suite", () => {
       const shown = { id: 5, amount: 100000, description: "Dinner" };
       const later = { id: 9, amount: 5000000, description: "Laptop" };
 
-      // A bill recorded after the prompt (higher id) is left unpaid: only ids up to 5 are settled.
+      // A bill recorded after the prompt (higher id) was never shown: it is left unpaid, the shown bill is paid.
       const newer = await press(`payallok:5:${hashOf([5])}`, { allResults: [shown, later] });
-      const upd = newer.statements.find((st) => st.sql.includes("UPDATE expenses"));
-      expect(upd?.sql).toContain("id <= ?");
-      expect(upd?.bindings).toEqual(["1111", 5]);
+      const paidIds = newer.statements.filter((st) => st.sql.startsWith("UPDATE expenses")).flatMap((st) => st.bindings.slice(1));
+      expect(paidIds).toEqual([5]);
+      expect(String(find(newer.calls, "editMessageText")?.text)).not.toContain("đã thay đổi");
+
+      // A fractional, negative or unknown maxId is never accepted, even when the hash of the bills below it matches.
+      for (const maxId of ["7.5", "-1", "0", "NaN", "Infinity", "5.0e0x", "6"]) {
+        const bad = await press(`payallok:${maxId}:${hashOf([5])}`, { allResults: [shown, { ...later, id: 7 }] });
+        expect(bad.statements.some((st) => st.sql.includes("UPDATE"))).toBe(false);
+        expect(String(find(bad.calls, "editMessageText")?.text)).toContain("đã thay đổi");
+      }
 
       // An older bill that became unpaid after the prompt changes the ID set: nothing is paid.
       const changed = await press(`payallok:5:${hashOf([5])}`, { allResults: [{ ...shown, id: 3 }, shown] });
@@ -1722,8 +1952,26 @@ describe("Expense Bot Suite", () => {
       const many = Array.from({ length: 150 }, (_, i) => ({ id: i + 1, amount: 1000, description: `b${i}` }));
       const { statements } = await press(`payallok:150:${hashOf(many.map((r) => r.id))}`, { allResults: many });
       // D1 allows at most 100 bound parameters per query.
-      expect(Math.max(...statements.map((st) => st.bindings.length))).toBeLessThanOrEqual(2);
-      expect(statements.some((st) => st.sql.includes("UPDATE expenses") && st.sql.includes("id <= ?"))).toBe(true);
+      expect(Math.max(...statements.map((st) => st.bindings.length))).toBeLessThanOrEqual(100);
+      // Every verified bill, and nothing else, is paid in one batch.
+      const paid = statements.filter((st) => st.sql.startsWith("UPDATE expenses")).flatMap((st) => st.bindings.slice(1));
+      expect(paid).toEqual(many.map((r) => r.id));
+    });
+
+    it("confirmedPayAllIds returns the shown bills' IDs, leaving newer bills out", () => {
+      const bills = [{ id: 3 }, { id: 5 }, { id: 7 }] as ExpenseRow[];
+      expect(confirmedPayAllIds(bills, ["7", hashOf([3, 5, 7])])).toEqual([3, 5, 7]);
+      // Bill 7 joined after the prompt for #3 and #5: they are paid, 7 is not.
+      expect(confirmedPayAllIds(bills, ["5", hashOf([3, 5])])).toEqual([3, 5]);
+      expect(confirmedPayAllIds(bills, ["3", hashOf([3])])).toEqual([3]);
+      expect(confirmedPayAllIds(bills, ["7.5", hashOf([3, 5, 7])])).toBeNull();
+      expect(confirmedPayAllIds(bills, ["6", hashOf([3, 5])])).toBeNull(); // not the id of a current bill
+      expect(confirmedPayAllIds(bills, ["8", hashOf([3, 5, 7])])).toBeNull();
+      expect(confirmedPayAllIds(bills, ["0", hashOf([])])).toBeNull();
+      expect(confirmedPayAllIds(bills, ["-3", hashOf([3])])).toBeNull();
+      expect(confirmedPayAllIds(bills, ["7", hashOf([3, 5])])).toBeNull(); // a shown bill is missing from the hash
+      expect(confirmedPayAllIds([{ id: 3 }, { id: 7 }] as ExpenseRow[], ["7", hashOf([3, 5, 7])])).toBeNull(); // #5 was paid
+      expect(confirmedPayAllIds([], ["0", hashOf([])])).toBeNull();
     });
 
     it("answers (and does nothing else) for malformed or message-less queries", async () => {
@@ -1986,6 +2234,32 @@ describe("Expense Bot Suite", () => {
         const fm = mockNetwork();
         await post(textUpdate("/help"), baseEnv(createMockD1().db));
         expect(sentMessages(fm)[0].text).toContain("Hướng dẫn sử dụng");
+      });
+
+      it("keeps replies inside the overall time budget instead of being cut off by waitUntil", async () => {
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        const run = async (geminiTakesMs: number) => {
+          let now = Date.now();
+          const dateNow = vi.spyOn(Date, "now").mockImplementation(() => now);
+          const inner = mockNetwork({ gemini: { transactions: [expenseItem(), expenseItem({ description: "Cafe" })] } });
+          const fm = vi.fn(async (input: string, init?: RequestInit) => {
+            if (String(input).includes(":generateContent")) now += geminiTakesMs;
+            return inner(input, init);
+          });
+          globalThis.fetch = fm as unknown as typeof fetch;
+          await post(textUpdate(), baseEnv(createMockD1().db));
+          dateNow.mockRestore();
+          return sentMessages(fm as unknown as ReturnType<typeof mockNetwork>);
+        };
+
+        expect(await run(10_000)).toHaveLength(2);
+        // Gemini used its whole share: the replies still have real time left.
+        expect(await run(TELEGRAM_PROCESSING_BUDGET_MS)).toHaveLength(2);
+        // Past the overall budget the saved transaction is still confirmed (guaranteed minimum), but the next
+        // confirmation is skipped: waitUntil would cut it off anyway.
+        const timeout = vi.spyOn(AbortSignal, "timeout");
+        expect(await run(TELEGRAM_TOTAL_BUDGET_MS + 1)).toHaveLength(1);
+        expect(timeout.mock.calls.map((c) => c[0])).toContain(TELEGRAM_MIN_REPLY_MS);
       });
 
       it("records a text expense, shows typing first and attaches action buttons", async () => {

@@ -1,4 +1,3 @@
-import { MAX_PAY_IDS } from "../constants";
 import { CategorySummaryRow, ExpenseRow } from "../types";
 
 /** A transaction to insert with {@link insertExpenses}. */
@@ -10,6 +9,15 @@ export interface ExpenseInsert {
   isPaid?: number;
   createdAt?: string;
 }
+
+/** Columns of a full {@link ExpenseRow}. */
+const EXPENSE_COLUMNS = "id, user_id, amount, category, description, payment_method, is_paid, created_at";
+
+/** Matches a user's unpaid credit card bills; binds the user ID. */
+const UNPAID_CARD_FILTER = "user_id = ? AND payment_method = 'credit_card' AND is_paid = 0";
+
+/** IDs bound per statement when settling bills (D1 allows 100 bound parameters per query; one is the user ID). */
+const SETTLE_CHUNK_SIZE = 90;
 
 function prepareExpenseInsert(db: D1Database, userId: string, row: ExpenseInsert): D1PreparedStatement {
   const safeUserId = (userId || "").trim() || "unknown_user";
@@ -165,7 +173,7 @@ export async function getRecentExpenses(db: D1Database, userId: string, limit = 
   const safeUserId = (userId || "").trim();
   const safeLimit = Math.max(1, Math.min(50, Math.floor(limit) || 10));
   const query = `
-    SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
+    SELECT ${EXPENSE_COLUMNS}
     FROM expenses
     WHERE user_id = ?
     ORDER BY id DESC
@@ -181,7 +189,7 @@ export async function getRecentExpenses(db: D1Database, userId: string, limit = 
 export async function getExpenseById(db: D1Database, userId: string, id: number): Promise<ExpenseRow | null> {
   if (!Number.isInteger(id) || id <= 0) return null;
   const query = `
-    SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
+    SELECT ${EXPENSE_COLUMNS}
     FROM expenses WHERE id = ? AND user_id = ?
   `;
   return (await db.prepare(query).bind(id, (userId || "").trim()).first<ExpenseRow>()) ?? null;
@@ -229,18 +237,30 @@ export async function updateExpensePayment(
  * claimed, i.e. Telegram retried a webhook that is being or has been processed.
  * Each ID is stored on its own, so updates delivered out of order (parallel connections) or with
  * a lower ID (Telegram restarts the sequence after a quiet week) are still processed.
- * Every claim also prunes IDs older than six days (cheap thanks to the received_at index), well before Telegram
- * could restart the sequence after a quiet week. The claim is one batch (prune + insert), i.e. one round trip.
+ * A stored ID older than six days counts as new again (its row is refreshed in the same statement): retries
+ * come within hours, while a restarted sequence can reuse an old ID, and this holds whether or not the row has
+ * been pruned yet. Pruning is only storage hygiene: every 100th update ID deletes rows older than six days
+ * (cheap thanks to the received_at index; sampled so the synchronous path before the 200 reply is usually a
+ * single write). The claim is one batch, i.e. one round trip.
  * Databases that predate the table keep de-duplicating without a manual migration: on "no such table" it is
  * created (with its index) and the claim retried once. Other errors propagate.
  */
 export async function claimTelegramUpdate(db: D1Database, updateId: number): Promise<boolean> {
   const claim = async (): Promise<boolean> => {
-    const results = await db.batch([
-      db.prepare("DELETE FROM telegram_updates WHERE received_at < datetime('now', '-6 days')"),
-      db.prepare("INSERT OR IGNORE INTO telegram_updates (update_id) VALUES (?)").bind(updateId),
-    ]);
-    return (results[1]?.meta?.changes ?? 1) > 0;
+    const statements = [
+      db
+        .prepare(
+          `INSERT INTO telegram_updates (update_id) VALUES (?)
+           ON CONFLICT(update_id) DO UPDATE SET received_at = CURRENT_TIMESTAMP
+           WHERE telegram_updates.received_at < datetime('now', '-6 days')`
+        )
+        .bind(updateId),
+    ];
+    if (updateId % 100 === 0) {
+      statements.unshift(db.prepare("DELETE FROM telegram_updates WHERE received_at < datetime('now', '-6 days')"));
+    }
+    const results = await db.batch(statements);
+    return (results[statements.length - 1]?.meta?.changes ?? 1) > 0;
   };
 
   try {
@@ -265,8 +285,7 @@ export async function getLastExpense(
   userId: string
 ): Promise<ExpenseRow | null> {
   const safeUserId = (userId || "").trim();
-  const query =
-    "SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 1";
+  const query = `SELECT ${EXPENSE_COLUMNS} FROM expenses WHERE user_id = ? ORDER BY id DESC LIMIT 1`;
   return (await db.prepare(query).bind(safeUserId).first<ExpenseRow>()) ?? null;
 }
 
@@ -299,9 +318,9 @@ export async function getUnpaidCreditCardExpenses(
 ): Promise<ExpenseRow[]> {
   const safeUserId = (userId || "").trim();
   const query = `
-    SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
+    SELECT ${EXPENSE_COLUMNS}
     FROM expenses
-    WHERE user_id = ? AND payment_method = 'credit_card' AND is_paid = 0
+    WHERE ${UNPAID_CARD_FILTER}
     ORDER BY id ASC
   `;
   const result = await db.prepare(query).bind(safeUserId).all<ExpenseRow>();
@@ -309,10 +328,10 @@ export async function getUnpaidCreditCardExpenses(
 }
 
 /**
- * Marks specified credit card transactions as paid (debt settlement).
- * Duplicate IDs count once; more than MAX_PAY_IDS distinct IDs settle nothing (callers check first, as D1 limits
- * bound parameters). Selects and updates in one transaction so the returned rows are exactly the ones this call
- * settled, even when the same bill is paid twice at once.
+ * Marks the given credit card transactions as paid (debt settlement) and returns the rows it settled, in ID order.
+ * Bills that are already paid or not the user's are skipped. Selects and updates in one batch (one transaction), so
+ * the returned rows are exactly the ones this call settled, even when the same bill is paid twice at once. IDs are
+ * bound in chunks to respect D1's parameter limit, so any number fits; callers validate and limit user input.
  */
 export async function payCreditCardExpenses(
   db: D1Database,
@@ -320,44 +339,22 @@ export async function payCreditCardExpenses(
   ids: number[]
 ): Promise<ExpenseRow[]> {
   const safeUserId = (userId || "").trim();
-  const validIds = [...new Set(ids.filter((id) => typeof id === "number" && Number.isInteger(id) && id > 0))];
-  if (validIds.length === 0 || validIds.length > MAX_PAY_IDS) {
-    return [];
+  const sortedIds = ids.filter((id) => Number.isInteger(id) && id > 0).sort((a, b) => a - b);
+  if (sortedIds.length === 0) return [];
+
+  const statements: D1PreparedStatement[] = [];
+  for (let i = 0; i < sortedIds.length; i += SETTLE_CHUNK_SIZE) {
+    const chunk = sortedIds.slice(i, i + SETTLE_CHUNK_SIZE);
+    const where = `${UNPAID_CARD_FILTER} AND id IN (${chunk.map(() => "?").join(", ")})`;
+    statements.push(
+      db.prepare(`SELECT ${EXPENSE_COLUMNS} FROM expenses WHERE ${where} ORDER BY id ASC`).bind(safeUserId, ...chunk),
+      db.prepare(`UPDATE expenses SET is_paid = 1, paid_at = CURRENT_TIMESTAMP WHERE ${where}`).bind(safeUserId, ...chunk)
+    );
   }
 
-  const placeholders = validIds.map(() => "?").join(", ");
-  const where = `user_id = ? AND payment_method = 'credit_card' AND is_paid = 0 AND id IN (${placeholders})`;
-  const [selected] = await db.batch<ExpenseRow>([
-    db
-      .prepare(
-        `SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
-         FROM expenses WHERE ${where} ORDER BY id ASC`
-      )
-      .bind(safeUserId, ...validIds),
-    db.prepare(`UPDATE expenses SET is_paid = 1, paid_at = CURRENT_TIMESTAMP WHERE ${where}`).bind(safeUserId, ...validIds),
-  ]);
-  return Array.isArray(selected?.results) ? selected.results : [];
-}
-
-/**
- * Marks every unpaid credit card transaction with an ID up to `maxId` as paid (a confirmed "pay all").
- * Uses a fixed number of parameters, so any number of bills fits in one query, and selects and
- * updates in one transaction so the returned rows are exactly the ones settled.
- */
-export async function payCreditCardExpensesUpTo(db: D1Database, userId: string, maxId: number): Promise<ExpenseRow[]> {
-  if (!Number.isInteger(maxId) || maxId <= 0) return [];
-  const safeUserId = (userId || "").trim();
-  const where = "user_id = ? AND payment_method = 'credit_card' AND is_paid = 0 AND id <= ?";
-  const [selected] = await db.batch<ExpenseRow>([
-    db
-      .prepare(
-        `SELECT id, user_id, amount, category, description, payment_method, is_paid, created_at
-         FROM expenses WHERE ${where} ORDER BY id ASC`
-      )
-      .bind(safeUserId, maxId),
-    db.prepare(`UPDATE expenses SET is_paid = 1, paid_at = CURRENT_TIMESTAMP WHERE ${where}`).bind(safeUserId, maxId),
-  ]);
-  return Array.isArray(selected?.results) ? selected.results : [];
+  const results = await db.batch<ExpenseRow>(statements);
+  // Even positions are the SELECTs; the chunks ascend, so the rows stay in ID order.
+  return results.flatMap((result, i) => (i % 2 === 0 && Array.isArray(result?.results) ? result.results : []));
 }
 
 /**

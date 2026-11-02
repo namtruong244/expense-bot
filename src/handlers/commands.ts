@@ -3,6 +3,7 @@ import {
   DEFAULT_GEMINI_MODEL,
   FALLBACK_GEMINI_MODEL,
   GEMINI_MODEL_NAME_PATTERN,
+  MAX_LIST_ROWS_CHARS,
   MAX_PAY_IDS,
 } from "../constants";
 import { escapeHtml, formatAmount, formatCurrency, formatDate, localMonth, percentBar, toLocalDate } from "../formatters";
@@ -18,7 +19,6 @@ import {
   getUnpaidCreditCardExpenses,
   getWeekExpensesByCategory,
   payCreditCardExpenses,
-  payCreditCardExpensesUpTo,
   setConfig,
 } from "../services/db";
 import { getDiscoveredModels, syncAvailableGeminiModels } from "../services/gemini";
@@ -30,6 +30,26 @@ const MAX_DEBT_BUTTONS = 8;
 const MAX_PAID_ROWS_LISTED = 20;
 /** Unpaid bills listed by /debt; the rest are summarised so the message fits Telegram's 4096 characters. */
 const MAX_DEBT_ROWS_LISTED = 25;
+/** Transactions listed by /today (the total still covers all of them); same reason. */
+const MAX_TODAY_ROWS_LISTED = 40;
+/** Models listed by /model (the list from Google has no fixed size); same reason. */
+const MAX_MODEL_ROWS_LISTED = 40;
+
+/**
+ * Joins as many `lines` as fit (at most `maxRows`, and MAX_LIST_ROWS_CHARS of HTML in total, which also bounds the
+ * message after Telegram decodes entities) and says how many were left out.
+ */
+function listRows(lines: string[], maxRows: number): string {
+  let text = "";
+  let listed = 0;
+  for (const line of lines.slice(0, maxRows)) {
+    if (text.length + line.length > MAX_LIST_ROWS_CHARS) break;
+    text += line;
+    listed++;
+  }
+  if (listed < lines.length) text += `… và ${lines.length - listed} khoản khác\n`;
+  return text;
+}
 
 function safeAmount(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -48,9 +68,10 @@ export function deleteConfirmKeyboard(id: number): InlineKeyboard {
 }
 
 /**
- * The unpaid bills a "pay all" prompt showed: every bill up to `maxId`, with their count and rounded total (for the
- * prompt text). The confirm button carries only `maxId` and the ID checksum: amounts never change, so the ID set
- * fully determines what was shown, and a bill recorded after the prompt is never paid unseen.
+ * The unpaid bills a "pay all" prompt showed: every unpaid bill, with their count and rounded total (for the
+ * prompt text). The confirm button carries only the highest bill ID and the checksum of the bill IDs: amounts never
+ * change, so the ID set fully determines what was shown, and only the bills it covers are ever paid (see
+ * {@link confirmedPayAllIds}).
  */
 interface PayAllSnapshot {
   maxId: number;
@@ -116,41 +137,33 @@ export async function sendPayAllConfirm(db: D1Database, token: string, chatId: n
 }
 
 /**
- * Checks a confirmed "pay all" prompt (`args` = its maxId and ID checksum) against the current unpaid
- * bills. Returns the maxId to pay up to, or null when the bills no longer match what the user saw.
+ * Checks a confirmed "pay all" prompt (`args` = the highest bill ID it showed and the checksum of the bill IDs it
+ * showed) against the current unpaid bills. The shown bills are the unpaid ones up to that ID; returns their IDs,
+ * to be paid as exactly that list, or null when they are no longer the ones the user saw (one was paid, deleted or
+ * toggled since). Bills newer than that ID (e.g. added by someone else in a group chat) are not part of the
+ * prompt: they are left unpaid and do not invalidate it.
  */
-export function confirmedPayAllMaxId(unpaid: ExpenseRow[], args: string[]): number | null {
+export function confirmedPayAllIds(unpaid: ExpenseRow[], args: string[]): number[] | null {
   // Buttons from older versions carry more fields (count, total) and are rejected, which re-prompts.
   if (args.length !== 2) return null;
   const maxId = Number(args[0]);
-  if (!Number.isFinite(maxId)) return null;
+  if (!Number.isInteger(maxId) || maxId <= 0 || !unpaid.some((r) => r.id === maxId)) return null;
   const shown = unpaid.filter((r) => r.id <= maxId);
-  if (!shown.length || billIdsHash(shown) !== args[1]) return null;
-  return maxId;
+  if (billIdsHash(shown) !== args[1]) return null;
+  return shown.map((r) => r.id);
 }
 
-/**
- * Settles credit card bills and returns the confirmation text, or null if none matched.
- * `target` is a list of bill IDs, or every unpaid bill up to a confirmed maxId.
- */
-export async function payBills(
-  db: D1Database,
-  userId: string,
-  target: number[] | { upToId: number }
-): Promise<string | null> {
-  const paidRows = Array.isArray(target)
-    ? await payCreditCardExpenses(db, userId, target)
-    : await payCreditCardExpensesUpTo(db, userId, target.upToId);
+/** Settles the credit card bills with the given IDs and returns the confirmation text, or null if none matched. */
+export async function payBills(db: D1Database, userId: string, ids: number[]): Promise<string | null> {
+  const paidRows = await payCreditCardExpenses(db, userId, ids);
   if (!paidRows.length) return null;
 
   const totalPaid = paidRows.reduce((sum, r) => sum + safeAmount(r.amount), 0);
   let msg = `✅ <b>Đã ghi nhận thanh toán thẻ tín dụng</b>\nĐã trả ${paidRows.length} khoản, tổng <b>${formatCurrency(totalPaid)}</b>:\n`;
-  for (const r of paidRows.slice(0, MAX_PAID_ROWS_LISTED)) {
-    msg += `• <b>#${r.id}</b> ${describeRow(r)}\n`;
-  }
-  if (paidRows.length > MAX_PAID_ROWS_LISTED) {
-    msg += `… và ${paidRows.length - MAX_PAID_ROWS_LISTED} khoản khác\n`;
-  }
+  msg += listRows(
+    paidRows.map((r) => `• <b>#${r.id}</b> ${describeRow(r)}\n`),
+    MAX_PAID_ROWS_LISTED
+  );
 
   const remaining = await getUnpaidCreditCardExpenses(db, userId);
   const remainingTotal = remaining.reduce((sum, r) => sum + safeAmount(r.amount), 0);
@@ -223,13 +236,12 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
           return;
         }
 
-        let total = 0;
+        const total = records.reduce((sum, row) => sum + safeAmount(row.amount), 0);
         let msg = "📅 <b>Giao dịch hôm nay</b>\n\n";
-
-        for (const row of records) {
-          total += safeAmount(row.amount);
-          msg += `• ${describeRow(row)}\n`;
-        }
+        msg += listRows(
+          records.map((row) => `• ${describeRow(row)}\n`),
+          MAX_TODAY_ROWS_LISTED
+        );
 
         const totalPrefix = total < 0 ? "🟢 Tiết kiệm ròng:" : "🔴 Tổng chi:";
         msg += `\n👉 <b>${totalPrefix} ${formatCurrency(total)}</b>`;
@@ -281,10 +293,13 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
           return;
         }
         let msg = "🕘 <b>Giao dịch gần nhất</b>\n\n";
-        for (const row of rows) {
-          const date = row.created_at ? formatDate(toLocalDate(row.created_at)).slice(0, 5) : "";
-          msg += `<code>#${row.id}</code> ${date} ${describeRow(row)}\n`;
-        }
+        msg += listRows(
+          rows.map((row) => {
+            const date = row.created_at ? formatDate(toLocalDate(row.created_at)).slice(0, 5) : "";
+            return `<code>#${row.id}</code> ${date} ${describeRow(row)}\n`;
+          }),
+          rows.length
+        );
         msg += "\n👉 Xoá một khoản: <code>/delete &lt;số hiệu&gt;</code>";
         await sendTelegram(token, chatId, msg);
         break;
@@ -329,18 +344,15 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
           return;
         }
 
-        let totalDebt = 0;
+        const totalDebt = unpaid.reduce((sum, bill) => sum + safeAmount(bill.amount), 0);
         let msg = "💳 <b>Các khoản thẻ tín dụng chưa trả</b>\n\n";
-
-        for (const [index, bill] of unpaid.entries()) {
-          totalDebt += safeAmount(bill.amount);
-          if (index >= MAX_DEBT_ROWS_LISTED) continue;
-          const date = bill.created_at ? ` (${formatDate(toLocalDate(bill.created_at))})` : "";
-          msg += `• <b>#${bill.id}</b> ${describeRow(bill)}${date}\n`;
-        }
-        if (unpaid.length > MAX_DEBT_ROWS_LISTED) {
-          msg += `… và ${unpaid.length - MAX_DEBT_ROWS_LISTED} khoản khác\n`;
-        }
+        msg += listRows(
+          unpaid.map((bill) => {
+            const date = bill.created_at ? ` (${formatDate(toLocalDate(bill.created_at))})` : "";
+            return `• <b>#${bill.id}</b> ${describeRow(bill)}${date}\n`;
+          }),
+          MAX_DEBT_ROWS_LISTED
+        );
 
         msg += `\n━━━━━━━━━━━━━━━\n💳 <b>Tổng nợ: ${formatCurrency(totalDebt)}</b>\n\n`;
         msg += "👉 Bấm nút bên dưới để trả, hoặc gõ <code>/pay 5</code>, <code>/pay 5,8</code>, <code>/pay all</code>";
@@ -403,11 +415,10 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
           let msg = "🤖 <b>Cài đặt model Gemini AI</b>\n\n";
           msg += `• Model đang dùng: <b>${escapeHtml(activeModel)}</b> ⭐\n\n`;
           msg += "📋 <b>Các model có sẵn:</b>\n";
-          for (let i = 0; i < models.length; i++) {
-            const m = models[i];
-            const star = m === activeModel ? " (đang dùng ⭐)" : "";
-            msg += `${i + 1}. <code>${escapeHtml(m)}</code>${star}\n`;
-          }
+          msg += listRows(
+            models.map((m, i) => `${i + 1}. <code>${escapeHtml(m)}</code>${m === activeModel ? " (đang dùng ⭐)" : ""}\n`),
+            MAX_MODEL_ROWS_LISTED
+          );
 
           msg += "\n💡 <b>Tuỳ chọn:</b>\n";
           msg += "• <code>/model &lt;tên&gt;</code>: đổi model (ví dụ <code>/model gemini-3.5-flash</code>)\n";
@@ -441,10 +452,10 @@ export async function handleCommand(command: string, chatId: number, env: Env): 
           let msg = lowerArg === "auto" ? "🔄 <b>Đã tự cập nhật model Gemini</b>\n" : "🔄 <b>Đã đồng bộ danh sách model Gemini</b>\n";
           msg += `Model đang dùng: <b>${escapeHtml(activeModel)}</b> ⭐\n\n`;
           msg += `Tìm thấy ${models.length} model tương thích:\n`;
-          for (const m of models) {
-            const star = m === activeModel ? " (đang dùng ⭐)" : "";
-            msg += `• <code>${escapeHtml(m)}</code>${star}\n`;
-          }
+          msg += listRows(
+            models.map((m) => `• <code>${escapeHtml(m)}</code>${m === activeModel ? " (đang dùng ⭐)" : ""}\n`),
+            MAX_MODEL_ROWS_LISTED
+          );
           msg += "\n👉 Đổi model bất cứ lúc nào: <code>/model &lt;tên&gt;</code>";
 
           await sendTelegram(token, chatId, msg);

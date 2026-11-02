@@ -1,4 +1,4 @@
-import { CATEGORIES, CATEGORY_LABELS, MAX_PAY_IDS } from "./constants";
+import { CATEGORIES, CATEGORY_LABELS, MAX_LISTED_DESCRIPTION_CHARS, MAX_PAY_IDS } from "./constants";
 import { escapeHtml, formatAmount, formatDate, localToday, toLocalDate } from "./formatters";
 import { ExpenseRow, InlineKeyboard } from "./types";
 
@@ -177,11 +177,26 @@ export function categoryKeyboard(id: number): InlineKeyboard {
   return { inline_keyboard: rows };
 }
 
+/**
+ * Cuts a description to MAX_LISTED_DESCRIPTION_CHARS characters, adding "…". The text is normalised to NFC (so
+ * Vietnamese typed with combining tone marks counts like precomposed text) and cut between grapheme clusters,
+ * never inside a combining sequence or a ZWJ emoji. Without Intl.Segmenter it cuts by code point, which at least
+ * keeps surrogate pairs whole.
+ */
+function shortDescription(description: string): string {
+  const text = description.normalize("NFC");
+  const units: string[] =
+    typeof Intl.Segmenter === "function"
+      ? Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text), (part) => part.segment)
+      : Array.from(text);
+  return units.length > MAX_LISTED_DESCRIPTION_CHARS ? `${units.slice(0, MAX_LISTED_DESCRIPTION_CHARS).join("")}…` : text;
+}
+
 /** One-line summary of a stored transaction, e.g. "🔴 45.000 ₫ · Ăn uống · Phở bò" (HTML-safe). */
 export function describeRow(row: ExpenseRow): string {
   const amount = typeof row.amount === "number" && Number.isFinite(row.amount) ? row.amount : 0;
   const icon = amount < 0 ? "🟢" : row.payment_method === "credit_card" ? "💳" : "🔴";
-  return `${icon} <b>${formatAmount(amount)}</b> · ${escapeHtml(categoryLabel(row.category || "Other"))} · ${escapeHtml(row.description || "Transaction")}`;
+  return `${icon} <b>${formatAmount(amount)}</b> · ${escapeHtml(categoryLabel(row.category || "Other"))} · ${escapeHtml(shortDescription(row.description || "Transaction"))}`;
 }
 
 /** Converts a stored row into the shape used by {@link savedText} (date only when not today). */

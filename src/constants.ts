@@ -47,8 +47,14 @@ export const CATEGORY_LABELS: Record<string, string> = {
 /** Local timezone offset (UTC+7) used for calendar-day reporting. */
 export const TZ_OFFSET_HOURS = 7;
 
-/** Most bill IDs one /pay command may settle (D1 allows 100 bound parameters per query). */
+/** Most bill IDs one /pay command may list (the "pay all" button has no such limit). */
 export const MAX_PAY_IDS = 50;
+
+/** Longest transaction description shown in lists; longer ones are cut so a list fits Telegram's 4096 characters. */
+export const MAX_LISTED_DESCRIPTION_CHARS = 80;
+
+/** Most HTML characters of bill rows in one list message (rows are dropped past this; leaves room for the rest of the text). */
+export const MAX_LIST_ROWS_CHARS = 3_000;
 
 /** Maximum number of transactions recorded from a single message. */
 export const MAX_TRANSACTIONS_PER_MESSAGE = 10;
@@ -66,10 +72,18 @@ export const FALLBACK_GEMINI_MODEL = "gemini-2.5-flash";
 export const MAX_GEMINI_ATTEMPTS = 3;
 
 /**
- * Time budgets for work done after the webhook has been answered. ctx.waitUntil() only gets 30 seconds,
- * so the photo download plus every Gemini attempt must finish well within it and still leave time to reply.
+ * Time budgets for processing a message (text or photo) after the webhook has been answered. They do not cover
+ * commands or button presses, whose Telegram calls just use TELEGRAM_API_TIMEOUT_MS. ctx.waitUntil() only gets 30
+ * seconds (https://developers.cloudflare.com/workers/platform/limits/), so the photo download plus every Gemini
+ * attempt (TELEGRAM_PROCESSING_BUDGET_MS) must leave real room to save and reply.
+ * TELEGRAM_TOTAL_BUDGET_MS bounds the whole job, with a small margin below the 30 s limit: each reply is cut to the
+ * time remaining and later ones are skipped past it. The replies that matter (the first confirmation of a saved
+ * transaction, an error answer) are always given at least TELEGRAM_MIN_REPLY_MS, so a user is never left without
+ * one for something that was saved.
  */
-export const TELEGRAM_PROCESSING_BUDGET_MS = 24_000;
+export const TELEGRAM_PROCESSING_BUDGET_MS = 22_000;
+export const TELEGRAM_TOTAL_BUDGET_MS = 29_000;
+export const TELEGRAM_MIN_REPLY_MS = 3_000;
 export const TELEGRAM_DOWNLOAD_TIMEOUT_MS = 6_000;
 export const GEMINI_TIMEOUT_MS = 18_000;
 /** Longest a single Telegram Bot API call (sendMessage, sendChatAction…) may take before it is given up. */
